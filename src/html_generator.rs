@@ -72,6 +72,9 @@ fn build_reveal_html(slides: &[PresentationFile]) -> String {
         />
 
         <style>
+            :root {
+            --r-background-color: #0b0b0b; /* Replace with your hex code */
+            }
             /* Ensures videos and images fill the screen properly */
             .reveal .slides section {
                 height: 100%;
