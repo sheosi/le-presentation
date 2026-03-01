@@ -40,7 +40,11 @@ fn path_files() -> Vec<PathBuf> {
 }
 
 pub fn open_link(link: &str) {
-    match xdg_open(link) {
+    try_run(xdg_open(link))
+}
+
+pub fn try_run(cmd: Option<Command>) {
+    match cmd {
         Some(mut cmd) => {
             cmd.spawn().expect("Failed to spawn link");
         }

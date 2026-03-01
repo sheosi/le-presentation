@@ -1,6 +1,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, net::SocketAddr, path::Path};
+use tokio::join;
 use tower_http::cors::CorsLayer;
 
 mod cmd;
@@ -8,7 +9,7 @@ mod dashboard;
 mod html_generator;
 use html_generator::generate_html;
 
-use crate::cmd::open_link;
+use crate::cmd::{open_link, try_run};
 
 #[derive(Serialize, Deserialize)]
 struct PresentationFile {
@@ -36,6 +37,17 @@ fn load_env() {
             }
         }
     }
+}
+
+async fn load_easy_effects() {
+    try_run(cmd::app("flatpak").map(|mut a| {
+        a.args(["run", "com.github.wwmm.easyeffects"]);
+        a
+    }));
+    try_run(cmd::app("flatpak").map(|mut a| {
+        a.args(["run", "com.github.wwmm.easyeffects", "-b", "2"]);
+        a
+    }))
 }
 
 #[tokio::main]
@@ -73,7 +85,8 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     open_link(&format!("http://localhost:{}/presentation", port));
-    axum::serve(listener, app).await.unwrap();
+    let (server_res, _) = join!(axum::serve(listener, app), load_easy_effects());
+    server_res.unwrap();
 }
 
 // Handler for dashboard
