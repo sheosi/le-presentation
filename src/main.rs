@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use serde::{Deserialize, Serialize};
 use std::{env, fs, net::SocketAddr, path::Path};
 use tokio::join;
-use tower_http::cors::CorsLayer;
+use tower_http::{cors::CorsLayer, services::ServeDir};
 
 mod cmd;
 mod dashboard;
@@ -71,7 +71,8 @@ async fn main() {
         .route("/", get(dashboard_handler))
         .route("/presentation", get(generate_html_endpoint))
         .layer(CorsLayer::permissive())
-        .with_state(config);
+        .with_state(config)
+        .fallback_service(ServeDir::new(&presentations_dir));
 
     // Run the server
     let port: u16 = env::var("PORT")
