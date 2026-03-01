@@ -57,8 +57,11 @@ async fn main() {
 
     // Get presentations directory
     let presentations_dir = env::var("PRESENTATIONS_DIR").unwrap_or_else(|_| {
-        println!("PRESENTATIONS_DIR not set, using default 'presentations' directory");
-        "presentations".to_string()
+        println!("PRESENTATIONS_DIR not set, using current directory");
+        std::env::current_dir()
+            .expect("Failed to get current dir")
+            .to_string_lossy()
+            .to_string()
     });
 
     // Create presentations directory if it doesn't exist
