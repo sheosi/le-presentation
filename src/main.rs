@@ -18,6 +18,12 @@ struct PresentationFile {
     size: u64,
 }
 
+#[derive(Clone)]
+struct RunningConf {
+    presentations_dir: String,
+    config: Config,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {}
 
@@ -74,7 +80,10 @@ async fn main() {
         .route("/", get(dashboard_handler))
         .route("/presentation", get(generate_html_endpoint))
         .layer(CorsLayer::permissive())
-        .with_state(config)
+        .with_state(RunningConf {
+            presentations_dir: presentations_dir.clone(),
+            config,
+        })
         .fallback_service(ServeDir::new(&presentations_dir));
 
     // Run the server
@@ -94,19 +103,15 @@ async fn main() {
 }
 
 // Handler for dashboard
-async fn dashboard_handler(_config: State<Config>) -> impl IntoResponse {
+async fn dashboard_handler(_config: State<RunningConf>) -> impl IntoResponse {
     let html = dashboard::main_dashboard();
     ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
 }
 
 // Handler to generate presentation HTML
-async fn generate_html_endpoint() -> impl IntoResponse {
-    // Get presentations directory from environment variable
-    let presentations_dir =
-        env::var("PRESENTATIONS_DIR").unwrap_or_else(|_| "presentations".to_string());
-
+async fn generate_html_endpoint(run_conf: State<RunningConf>) -> impl IntoResponse {
     // Get presentation files from directory
-    match get_presentation_files(&presentations_dir) {
+    match get_presentation_files(&run_conf.presentations_dir) {
         Ok(files) => {
             // Convert to the right type for the HTML generator
             let html_files = files
