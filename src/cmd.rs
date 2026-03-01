@@ -46,8 +46,8 @@ pub fn open_link(link: &str) {
 pub fn try_run(cmd: Option<Command>) {
     match cmd {
         Some(mut cmd) => {
-            cmd.spawn().expect("Failed to spawn link");
+            cmd.spawn().expect("Failed to spawn exec");
         }
-        None => eprintln!("Failed to open link: {}", link),
+        None => eprintln!("Failed to spawn exec"),
     }
 }
