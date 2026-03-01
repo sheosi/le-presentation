@@ -40,7 +40,10 @@ fn path_files() -> Vec<PathBuf> {
 }
 
 pub fn open_link(link: &str) {
-    if xdg_open(link).is_none() {
-        eprintln!("Failed to open link: {}", link);
+    match xdg_open(link) {
+        Some(mut cmd) => {
+            cmd.spawn().expect("Failed to spawn link");
+        }
+        None => eprintln!("Failed to open link: {}", link),
     }
 }

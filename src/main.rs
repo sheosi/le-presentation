@@ -68,12 +68,11 @@ async fn main() {
         .unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    open_link(&format!("http://localhost:{}", port));
-
     println!("Server listening on {}", addr);
     println!("Presentations directory: {}", presentations_dir);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    open_link(&format!("http://localhost:{}/presentation", port));
     axum::serve(listener, app).await.unwrap();
 }
 
