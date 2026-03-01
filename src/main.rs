@@ -1,10 +1,14 @@
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, net::SocketAddr, path::Path};
 use tower_http::cors::CorsLayer;
 
+mod cmd;
+mod dashboard;
 mod html_generator;
 use html_generator::generate_html;
+
+use crate::cmd::open_link;
 
 #[derive(Serialize, Deserialize)]
 struct PresentationFile {
@@ -13,12 +17,8 @@ struct PresentationFile {
     size: u64,
 }
 
-#[derive(Serialize, Deserialize)]
-struct PresentationResponse {
-    files: Vec<PresentationFile>,
-    count: usize,
-    presentations_directory: String,
-}
+#[derive(Clone, Serialize, Deserialize)]
+struct Config {}
 
 /// Load configuration from ".env" if available
 fn load_env() {
@@ -52,11 +52,14 @@ async fn main() {
     // Create presentations directory if it doesn't exist
     create_presentations_dir_if_needed(&presentations_dir);
 
+    let config = Config {};
+
     // Build our application with a route
     let app = Router::new()
-        .route("/presentation", get(list_presentations))
-        .route("/presentation.html", get(generate_html_endpoint))
-        .layer(CorsLayer::permissive());
+        .route("/", get(dashboard_handler))
+        .route("/presentation", get(generate_html_endpoint))
+        .layer(CorsLayer::permissive())
+        .with_state(config);
 
     // Run the server
     let port: u16 = env::var("PORT")
@@ -65,6 +68,8 @@ async fn main() {
         .unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+    open_link(&format!("http://localhost:{}", port));
+
     println!("Server listening on {}", addr);
     println!("Presentations directory: {}", presentations_dir);
 
@@ -72,26 +77,10 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-// Handler function for listing presentation files
-async fn list_presentations() -> impl IntoResponse {
-    // Get presentations directory from environment variable
-    let presentations_dir =
-        env::var("PRESENTATIONS_DIR").unwrap_or_else(|_| "presentations".to_string());
-
-    match scan_presentations_directory(&presentations_dir) {
-        Ok(files) => {
-            let response = PresentationResponse {
-                count: files.len(),
-                files,
-                presentations_directory: presentations_dir,
-            };
-            Json(response).into_response()
-        }
-        Err(e) => {
-            eprintln!("Error scanning presentations directory: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
-        }
-    }
+// Handler for dashboard
+async fn dashboard_handler(_config: State<Config>) -> impl IntoResponse {
+    let html = dashboard::main_dashboard();
+    ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
 }
 
 // Handler to generate presentation HTML
@@ -192,39 +181,4 @@ fn create_presentations_dir_if_needed(dir: &str) {
             Err(e) => eprintln!("Failed to create presentations directory: {}", e),
         }
     }
-}
-
-// Helper function to scan the presentations directory for JSON listing
-fn scan_presentations_directory(
-    dir: &str,
-) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
-    let mut files = Vec::new();
-    let path = Path::new(dir);
-
-    if !path.exists() {
-        return Err(format!("Directory '{}' not found", dir).into());
-    }
-
-    let entries = fs::read_dir(path)?;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Skip directories
-        if path.is_dir() {
-            continue;
-        }
-
-        // Get file metadata
-        let metadata = entry.metadata()?;
-
-        files.push(PresentationFile {
-            name: entry.file_name().to_string_lossy().to_string(),
-            path: path.to_string_lossy().to_string(),
-            size: metadata.len(),
-        });
-    }
-
-    Ok(files)
 }
