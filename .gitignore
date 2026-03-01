@@ -1,0 +1,12 @@
+/target
+*.log
+.DS_Store
+.env
+*.pdf
+*.mov
+*.mp4
+*.key
+*.ppt
+*.pptx
+presentations/*
+!presentations/.gitkeep
