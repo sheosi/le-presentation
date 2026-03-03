@@ -170,10 +170,16 @@ fn get_presentation_files(dir: &str) -> Result<Vec<PresentationFile>, Box<dyn st
             continue;
         }
 
+        let f_lower = file_name.to_lowercase();
+
         // Handle PDF conversion
-        if file_name.to_lowercase().ends_with(".pdf") {
+        if f_lower.ends_with(".pdf") {
             let pdf_path = entry.path();
             let converted_files = convert_pdf_to_images(&pdf_path)?;
+            files.extend(converted_files);
+        } else if f_lower.ends_with(".pptx") | f_lower.ends_with(".ppt") {
+            let pptx_path = entry.path();
+            let converted_files = convert_pptx_to_svgs(&pptx_path)?;
             files.extend(converted_files);
         } else {
             // Add valid media file
@@ -200,9 +206,11 @@ fn get_pdf_pages(pdf_path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
 }
 
 fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let status = app("libreoffice")
+    let status = app("flatpak")
         .unwrap()
         .args([
+            &OsStr::from_bytes(b"run"),
+            &OsStr::from_bytes(b"org.libreoffice.LibreOffice"),
             &OsStr::from_bytes(b"--headless"),
             &OsStr::from_bytes(b"--convert-to"),
             &OsStr::from_bytes(b"pdf"),
@@ -217,6 +225,15 @@ fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(pptx_path.with_extension("pdf"))
 }
 
+fn convert_pptx_to_svgs(
+    pptx_path: &Path,
+) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
+    let pdf_path = convert_pptx_to_pdf(pptx_path)?;
+    let result = convert_pdf_to_images(&pdf_path)?;
+    let _ = fs::remove_file(&pdf_path);
+    Ok(result)
+}
+
 fn convert_pdf_to_images(
     pdf_path: &Path,
 ) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
@@ -226,12 +243,18 @@ fn convert_pdf_to_images(
     let mut result = Vec::with_capacity(page_count as usize);
     // 3. Loop through and run pdf2svg for each page
     for i in 1..=page_count {
-        let output_svg = format!("slide_{}.svg", i);
+        let output_svg = format!(
+            "{}_{}.svg",
+            pdf_path.file_stem().expect("").to_str().expect(""),
+            i
+        );
         let svg_status = app("pdf2svg")
             .unwrap()
-            .arg(pdf_path)
-            .arg(&output_svg)
-            .arg(i.to_string())
+            .args([
+                pdf_path.as_os_str(),
+                OsStr::from_bytes(output_svg.as_bytes()),
+                OsStr::from_bytes(i.to_string().as_bytes()),
+            ])
             .status()?;
 
         if svg_status.success() {
@@ -262,6 +285,8 @@ fn is_media_file(filename: &str) -> bool {
             | "ogg"
             | "mkv"
             | "pdf"
+            | "ppt"
+            | "pptx"
     )
 }
 
