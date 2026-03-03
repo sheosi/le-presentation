@@ -8,7 +8,15 @@ use axum::{
 };
 use serde::Deserialize;
 use serde::Serialize;
-use std::{env, fs, net::SocketAddr, path::Path};
+use std::{
+    env,
+    error::Error,
+    ffi::OsStr,
+    fs,
+    net::SocketAddr,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 use tokio::join;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
@@ -177,7 +185,7 @@ fn get_presentation_files(dir: &str) -> Result<Vec<PresentationFile>, Box<dyn st
 }
 
 fn get_pdf_pages(pdf_path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
-    let output = app("pdfinfo").arg(temp_pdf).output()?;
+    let output = app("pdfinfo").unwrap().arg(pdf_path).output()?;
     let info_str = str::from_utf8(&output.stdout)?;
 
     let page_count = info_str
@@ -193,19 +201,25 @@ fn get_pdf_pages(pdf_path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
 
 fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let status = app("libreoffice")
-        .args(["--headless", "--convert-to", "pdf", input_pptx])
+        .unwrap()
+        .args([
+            &OsStr::from_bytes(b"--headless"),
+            &OsStr::from_bytes(b"--convert-to"),
+            &OsStr::from_bytes(b"pdf"),
+            pptx_path.as_os_str(),
+        ])
         .status()?;
 
     if !status.success() {
         return Err("Failed to convert PPTX to PDF".into());
     }
+
+    Ok(pptx_path.with_extension("pdf"))
 }
 
 fn convert_pdf_to_images(
     pdf_path: &Path,
 ) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
-    let pdf_name = pdf_path.file_stem().unwrap().to_string_lossy();
-
     // 2. Get the number of pages using pdfinfo
     let page_count = get_pdf_pages(pdf_path)?;
 
@@ -214,12 +228,15 @@ fn convert_pdf_to_images(
     for i in 1..=page_count {
         let output_svg = format!("slide_{}.svg", i);
         let svg_status = app("pdf2svg")
-            .args([temp_pdf, &output_svg, &i.to_string()])
+            .unwrap()
+            .arg(pdf_path)
+            .arg(&output_svg)
+            .arg(i.to_string())
             .status()?;
 
         if svg_status.success() {
-            result.push(PresentationFile { name: output_svg });
             println!("Generated: {}", output_svg);
+            result.push(PresentationFile { name: output_svg });
         }
     }
 
