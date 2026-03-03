@@ -1,5 +1,13 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
-use serde::{Deserialize, Serialize};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    response::Redirect,
+    routing::{get, post},
+    Router,
+};
+use serde::Deserialize;
+use serde::Serialize;
 use std::{env, fs, net::SocketAddr, path::Path};
 use tokio::join;
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -79,6 +87,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(dashboard_handler))
         .route("/presentation", get(generate_html_endpoint))
+        .route("/settings/limiter", post(limiter_handler))
         .layer(CorsLayer::permissive())
         .with_state(RunningConf {
             presentations_dir: presentations_dir.clone(),
@@ -191,6 +200,29 @@ fn is_media_file(filename: &str) -> bool {
             | "ogg"
             | "mkv"
     )
+}
+
+#[derive(Deserialize)]
+struct LimiterQuery {
+    enable: bool,
+}
+
+async fn limiter_handler(
+    State(_config): State<RunningConf>,
+    Query(query): Query<LimiterQuery>,
+) -> impl IntoResponse {
+    if query.enable {
+        try_run(cmd::app("flatpak").map(|mut a| {
+            a.args(["run", "com.github.wwmm.easyeffects", "-b", "2"]);
+            a
+        }));
+    } else {
+        try_run(cmd::app("flatpak").map(|mut a| {
+            a.args(["run", "com.github.wwmm.easyeffects", "-b", "1"]);
+            a
+        }));
+    }
+    Redirect::to("/")
 }
 
 // Helper function to create presentations directory
