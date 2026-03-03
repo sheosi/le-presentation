@@ -16,19 +16,14 @@ mod cmd;
 mod dashboard;
 mod html_generator;
 use html_generator::generate_html;
+use html_generator::PresentationFile;
 
-use crate::cmd::{open_link, try_run};
-
-#[derive(Serialize, Deserialize)]
-struct PresentationFile {
-    name: String,
-    path: String,
-    size: u64,
-}
+use crate::cmd::{app, open_link, try_run};
 
 #[derive(Clone)]
 struct RunningConf {
     presentations_dir: String,
+    limiter_on: bool,
     config: Config,
 }
 
@@ -91,6 +86,7 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(RunningConf {
             presentations_dir: presentations_dir.clone(),
+            limiter_on: true,
             config,
         })
         .fallback_service(ServeDir::new(&presentations_dir));
@@ -125,11 +121,7 @@ async fn generate_html_endpoint(run_conf: State<RunningConf>) -> impl IntoRespon
             // Convert to the right type for the HTML generator
             let html_files = files
                 .into_iter()
-                .map(|f| html_generator::PresentationFile {
-                    name: f.name,
-                    path: f.path,
-                    size: f.size,
-                })
+                .map(|f| html_generator::PresentationFile { name: f.name })
                 .collect();
 
             let html_content = generate_html(html_files);
@@ -170,15 +162,68 @@ fn get_presentation_files(dir: &str) -> Result<Vec<PresentationFile>, Box<dyn st
             continue;
         }
 
-        // Add valid media file
-        files.push(PresentationFile {
-            name: file_name,
-            path: entry.path().to_string_lossy().to_string(),
-            size: metadata.len(),
-        });
+        // Handle PDF conversion
+        if file_name.to_lowercase().ends_with(".pdf") {
+            let pdf_path = entry.path();
+            let converted_files = convert_pdf_to_images(&pdf_path)?;
+            files.extend(converted_files);
+        } else {
+            // Add valid media file
+            files.push(PresentationFile { name: file_name });
+        }
     }
 
     Ok(files)
+}
+
+fn get_pdf_pages(pdf_path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
+    let output = app("pdfinfo").arg(temp_pdf).output()?;
+    let info_str = str::from_utf8(&output.stdout)?;
+
+    let page_count = info_str
+        .lines()
+        .find(|line| line.starts_with("Pages:"))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|count| count.parse::<u32>().ok())
+        .ok_or("Could not determine page count")?;
+
+    println!("Found {} slides. Converting to SVG...", page_count);
+    Ok(page_count)
+}
+
+fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let status = app("libreoffice")
+        .args(["--headless", "--convert-to", "pdf", input_pptx])
+        .status()?;
+
+    if !status.success() {
+        return Err("Failed to convert PPTX to PDF".into());
+    }
+}
+
+fn convert_pdf_to_images(
+    pdf_path: &Path,
+) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
+    let pdf_name = pdf_path.file_stem().unwrap().to_string_lossy();
+
+    // 2. Get the number of pages using pdfinfo
+    let page_count = get_pdf_pages(pdf_path)?;
+
+    let mut result = Vec::with_capacity(page_count as usize);
+    // 3. Loop through and run pdf2svg for each page
+    for i in 1..=page_count {
+        let output_svg = format!("slide_{}.svg", i);
+        let svg_status = app("pdf2svg")
+            .args([temp_pdf, &output_svg, &i.to_string()])
+            .status()?;
+
+        if svg_status.success() {
+            result.push(PresentationFile { name: output_svg });
+            println!("Generated: {}", output_svg);
+        }
+    }
+
+    Ok(result)
 }
 
 // Helper function to check if a file is a media file
@@ -199,6 +244,7 @@ fn is_media_file(filename: &str) -> bool {
             | "webm"
             | "ogg"
             | "mkv"
+            | "pdf"
     )
 }
 

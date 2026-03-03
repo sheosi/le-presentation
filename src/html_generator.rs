@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PresentationFile {
     pub name: String,
-    pub path: String,
-    pub size: u64,
 }
 
 impl PresentationFile {
@@ -172,16 +170,12 @@ mod tests {
     fn test_file_type_detection() {
         let video_file = PresentationFile {
             name: "PRESENTACION 1.1.mp4".to_string(),
-            path: "/path/to/file.mp4".to_string(),
-            size: 1024,
         };
         assert!(video_file.is_video());
         assert!(!video_file.is_image());
 
         let image_file = PresentationFile {
             name: "PRESENTACION 1.0.png".to_string(),
-            path: "/path/to/file.png".to_string(),
-            size: 2048,
         };
         assert!(image_file.is_image());
         assert!(!image_file.is_video());
@@ -192,13 +186,9 @@ mod tests {
         let files = vec![
             PresentationFile {
                 name: "PRESENTACION-1.0.png".to_string(),
-                path: "PRESENTACION-1.0.png".to_string(),
-                size: 1024,
             },
             PresentationFile {
                 name: "PRESENTACION-1.1.mp4".to_string(),
-                path: "PRESENTACION-1.1.mp4".to_string(),
-                size: 2048,
             },
         ];
 
