@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Form, State},
     http::StatusCode,
     response::IntoResponse,
     response::Redirect,
@@ -15,6 +15,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use tokio::join;
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -28,7 +29,9 @@ use html_generator::PresentationFile;
 use crate::cmd::{app, open_link, try_run};
 
 #[derive(Clone)]
-struct RunningConf {
+struct RunningConf(Arc<Mutex<RunningConfInner>>);
+
+struct RunningConfInner {
     presentations_dir: String,
     limiter_on: bool,
     config: Config,
@@ -91,11 +94,11 @@ async fn main() {
         .route("/presentation", get(generate_html_endpoint))
         .route("/settings/limiter", post(limiter_handler))
         .layer(CorsLayer::permissive())
-        .with_state(RunningConf {
+        .with_state(RunningConf(Arc::new(Mutex::new(RunningConfInner {
             presentations_dir: presentations_dir.clone(),
             limiter_on: true,
             config,
-        })
+        }))))
         .fallback_service(ServeDir::new(&presentations_dir));
 
     // Run the server
@@ -115,15 +118,15 @@ async fn main() {
 }
 
 // Handler for dashboard
-async fn dashboard_handler(_config: State<RunningConf>) -> impl IntoResponse {
-    let html = dashboard::main_dashboard();
+async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoResponse {
+    let html = dashboard::main_dashboard(config.0.lock().expect("").limiter_on);
     ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
 }
 
 // Handler to generate presentation HTML
-async fn generate_html_endpoint(run_conf: State<RunningConf>) -> impl IntoResponse {
+async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl IntoResponse {
     // Get presentation files from directory
-    match get_presentation_files(&run_conf.presentations_dir) {
+    match get_presentation_files(&run_conf.0.lock().expect("").presentations_dir) {
         Ok(files) => {
             let html_content = generate_html(files);
             ([("Content-Type", "text/html; charset=utf-8")], html_content).into_response()
@@ -305,19 +308,22 @@ fn is_media_file(filename: &str) -> bool {
 
 #[derive(Deserialize)]
 struct LimiterQuery {
-    enable: bool,
+    enable: Option<String>,
 }
 
 async fn limiter_handler(
-    State(_config): State<RunningConf>,
-    Query(query): Query<LimiterQuery>,
+    State(config): State<RunningConf>,
+    Form(query): Form<LimiterQuery>,
 ) -> impl IntoResponse {
-    if query.enable {
+    println!("{:?}", query.enable);
+    if query.enable.as_deref() == Some("on") {
+        config.0.lock().expect("").limiter_on = true;
         try_run(cmd::app("flatpak").map(|mut a| {
             a.args(["run", "com.github.wwmm.easyeffects", "-b", "2"]);
             a
         }));
     } else {
+        config.0.lock().expect("").limiter_on = false;
         try_run(cmd::app("flatpak").map(|mut a| {
             a.args(["run", "com.github.wwmm.easyeffects", "-b", "1"]);
             a
