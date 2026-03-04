@@ -223,15 +223,37 @@ fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
 fn convert_pptx_to_svgs(
     pptx_path: &Path,
 ) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
-    let pdf_path = convert_pptx_to_pdf(pptx_path)?;
-    let result = convert_pdf_to_images(&pdf_path)?;
-    let _ = fs::remove_file(&pdf_path);
-    Ok(result)
+    if !pptx_path
+        .with_file_name(format!(
+            "{}_1.svg",
+            pptx_path.file_stem().expect("").to_str().expect("")
+        ))
+        .exists()
+    {
+        let pdf_path = convert_pptx_to_pdf(pptx_path)?;
+        let result = convert_pdf_to_images(&pdf_path)?;
+        let _ = fs::remove_file(&pdf_path);
+        Ok(result)
+    } else {
+        // If they already exist will be picked as part of the FS pass
+        Ok(OrderMap::new())
+    }
 }
 
 fn convert_pdf_to_images(
     pdf_path: &Path,
 ) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
+    if pdf_path
+        .with_file_name(format!(
+            "{}_1.svg",
+            pdf_path.file_stem().expect("").to_str().expect("")
+        ))
+        .exists()
+    {
+        // They already exist, will be picked as part of the FS pass
+        return Ok(OrderMap::new());
+    }
+
     let page_count = get_pdf_pages(pdf_path)?;
 
     let mut result = OrderMap::new();
