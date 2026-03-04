@@ -1,3 +1,4 @@
+use ordermap::OrderMap;
 use serde::{Deserialize, Serialize};
 
 /// Represents a presentation file for HTML generation
@@ -33,15 +34,13 @@ impl PresentationFile {
 }
 
 /// Generates Reveal.js HTML from a list of presentation files
-pub fn generate_html(presentation_files: Vec<PresentationFile>) -> String {
+pub fn generate_html(presentation_files: OrderMap<String, PresentationFile>) -> String {
     // Filter only show valid media files
-    let mut slides: Vec<PresentationFile> = presentation_files
+    let slides: Vec<PresentationFile> = presentation_files
         .into_iter()
-        .filter(|f| f.is_image() || f.is_video())
+        .filter(|(_, f)| f.is_image() || f.is_video())
+        .map(|(_, f)| f)
         .collect();
-
-    // Sort slides by filename
-    slides.sort_by(|a, b| a.name.cmp(&b.name));
 
     build_reveal_html(&slides)
 }

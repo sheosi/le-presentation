@@ -6,15 +6,14 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use ordermap::OrderMap;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{
     env,
     error::Error,
-    ffi::OsStr,
     fs,
     net::SocketAddr,
-    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 use tokio::join;
@@ -126,13 +125,7 @@ async fn generate_html_endpoint(run_conf: State<RunningConf>) -> impl IntoRespon
     // Get presentation files from directory
     match get_presentation_files(&run_conf.presentations_dir) {
         Ok(files) => {
-            // Convert to the right type for the HTML generator
-            let html_files = files
-                .into_iter()
-                .map(|f| html_generator::PresentationFile { name: f.name })
-                .collect();
-
-            let html_content = generate_html(html_files);
+            let html_content = generate_html(files);
             ([("Content-Type", "text/html; charset=utf-8")], html_content).into_response()
         }
         Err(e) => {
@@ -143,8 +136,10 @@ async fn generate_html_endpoint(run_conf: State<RunningConf>) -> impl IntoRespon
 }
 
 // Helper function to get presentation files for HTML generation
-fn get_presentation_files(dir: &str) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
-    let mut files = Vec::new();
+fn get_presentation_files(
+    dir: &str,
+) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
+    let mut files = OrderMap::new();
     let path = Path::new(dir);
 
     if !path.exists() {
@@ -183,7 +178,7 @@ fn get_presentation_files(dir: &str) -> Result<Vec<PresentationFile>, Box<dyn st
             files.extend(converted_files);
         } else {
             // Add valid media file
-            files.push(PresentationFile { name: file_name });
+            files.insert(file_name.clone(), PresentationFile { name: file_name });
         }
     }
 
@@ -209,13 +204,13 @@ fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let status = app("flatpak")
         .unwrap()
         .args([
-            &OsStr::from_bytes(b"run"),
-            &OsStr::from_bytes(b"org.libreoffice.LibreOffice"),
-            &OsStr::from_bytes(b"--headless"),
-            &OsStr::from_bytes(b"--convert-to"),
-            &OsStr::from_bytes(b"pdf"),
-            pptx_path.as_os_str(),
+            "run",
+            "org.libreoffice.LibreOffice",
+            "--headless",
+            "--convert-to",
+            "pdf",
         ])
+        .arg(pptx_path)
         .status()?;
 
     if !status.success() {
@@ -227,7 +222,7 @@ fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
 
 fn convert_pptx_to_svgs(
     pptx_path: &Path,
-) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
+) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
     let pdf_path = convert_pptx_to_pdf(pptx_path)?;
     let result = convert_pdf_to_images(&pdf_path)?;
     let _ = fs::remove_file(&pdf_path);
@@ -236,12 +231,10 @@ fn convert_pptx_to_svgs(
 
 fn convert_pdf_to_images(
     pdf_path: &Path,
-) -> Result<Vec<PresentationFile>, Box<dyn std::error::Error>> {
-    // 2. Get the number of pages using pdfinfo
+) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
     let page_count = get_pdf_pages(pdf_path)?;
 
-    let mut result = Vec::with_capacity(page_count as usize);
-    // 3. Loop through and run pdf2svg for each page
+    let mut result = OrderMap::new();
     for i in 1..=page_count {
         let output_svg = format!(
             "{}_{}.svg",
@@ -250,16 +243,14 @@ fn convert_pdf_to_images(
         );
         let svg_status = app("pdf2svg")
             .unwrap()
-            .args([
-                pdf_path.as_os_str(),
-                OsStr::from_bytes(output_svg.as_bytes()),
-                OsStr::from_bytes(i.to_string().as_bytes()),
-            ])
+            .arg(pdf_path)
+            .arg(&output_svg)
+            .arg(i.to_string())
             .status()?;
 
         if svg_status.success() {
             println!("Generated: {}", output_svg);
-            result.push(PresentationFile { name: output_svg });
+            result.insert(output_svg.clone(), PresentationFile { name: output_svg });
         }
     }
 
