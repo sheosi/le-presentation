@@ -315,7 +315,6 @@ async fn limiter_handler(
     State(config): State<RunningConf>,
     Form(query): Form<LimiterQuery>,
 ) -> impl IntoResponse {
-    println!("{:?}", query.enable);
     if query.enable.as_deref() == Some("on") {
         config.0.lock().expect("").limiter_on = true;
         try_run(cmd::app("flatpak").map(|mut a| {
