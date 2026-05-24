@@ -45,6 +45,105 @@ pub fn generate_html(presentation_files: OrderMap<String, PresentationFile>) -> 
     build_reveal_html(&slides)
 }
 
+/// Generates HTML showing "No se ha encontrado dispositivo" message
+pub fn generate_no_folder_html() -> String {
+    build_message_html("No se ha encontrado dispositivo")
+}
+
+/// Generates HTML showing "El dispositivo está vacío" message
+pub fn generate_empty_folder_html() -> String {
+    build_message_html("El dispositivo está vacío")
+}
+
+/// Builds HTML with a centered message for error states
+fn build_message_html(message: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="es">
+    <head>
+        <meta charset="utf-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+        />
+        <title>Presentación</title>
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            html, body {{
+                width: 100%;
+                height: 100%;
+                background-color: #1a1a1a;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }}
+            .message {{
+                font-size: clamp(2rem, 8vw, 5rem);
+                font-weight: 600;
+                color: #6b7280;
+                text-align: center;
+                padding: 2rem;
+                line-height: 1.3;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="message">{}</div>
+
+        <script>
+            // WebSocket auto-reload: reconnects and waits for reload signal
+            (function() {{
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = wsProtocol + '//' + window.location.host + '/presentation/ws';
+                let ws = null;
+                let reconnectDelay = 1000;
+                const maxReconnectDelay = 30000;
+
+                function connect() {{
+                    ws = new WebSocket(wsUrl);
+
+                    ws.onopen = function() {{
+                        console.log('Live reload connected');
+                        reconnectDelay = 1000;
+                    }};
+
+                    ws.onmessage = function(event) {{
+                        if (event.data === 'reload') {{
+                            console.log('Presentation changed, reloading...');
+                            window.location.reload();
+                        }}
+                    }};
+
+                    ws.onclose = function() {{
+                        console.log('Live reload disconnected, reconnecting in ' + reconnectDelay + 'ms...');
+                        setTimeout(connect, reconnectDelay);
+                        reconnectDelay = Math.min(reconnectDelay * 2, maxReconnectDelay);
+                    }};
+
+                    ws.onerror = function(err) {{
+                        console.error('Live reload error:', err);
+                        ws.close();
+                    }};
+                }}
+
+                if (document.readyState === 'loading') {{
+                    document.addEventListener('DOMContentLoaded', connect);
+                }} else {{
+                    connect();
+                }}
+            }})();
+        </script>
+    </body>
+</html>"#,
+        html_escape(message)
+    )
+}
+
 /// Builds the Reveal.js HTML template
 fn build_reveal_html(slides: &[PresentationFile]) -> String {
     let mut html = String::from(

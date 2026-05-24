@@ -30,7 +30,9 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 mod cmd;
 mod dashboard;
 mod html_generator;
+use html_generator::generate_empty_folder_html;
 use html_generator::generate_html;
+use html_generator::generate_no_folder_html;
 use html_generator::PresentationFile;
 
 use crate::cmd::{app, open_link, try_run};
@@ -141,8 +143,17 @@ async fn main() {
 
 /// Watch the presentations directory for changes and broadcast reloads
 async fn watch_presentations_dir(run_conf: RunningConf) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
+
+    // Wait for directory to exist
+    let path = Path::new(&presentations_dir);
+    while !path.exists() {
+        sleep(Duration::from_secs(2)).await;
+    }
+
+    // Now set up the watcher
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let tx_clone = tx.clone();
 
     let mut watcher = RecommendedWatcher::new(
         move |res: Result<Event, notify::Error>| {
@@ -152,7 +163,7 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
                     notify::EventKind::Create(_)
                     | notify::EventKind::Remove(_)
                     | notify::EventKind::Modify(_) => {
-                        let _ = tx.try_send(());
+                        let _ = tx_clone.try_send(());
                     }
                     _ => {}
                 }
@@ -175,6 +186,9 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
     let mut pending_reload = false;
     let debounce_duration = Duration::from_millis(500);
 
+    // Track previous state to detect folder creation/deletion
+    let mut folder_existed = true;
+
     loop {
         tokio::select! {
             // Wait for file system events
@@ -185,13 +199,40 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
             _ = sleep(debounce_duration), if pending_reload => {
                 pending_reload = false;
 
+                let path = Path::new(&presentations_dir);
+                let exists_now = path.exists();
+
+                // Detect folder creation
+                if exists_now && !folder_existed {
+                    println!("Presentations folder created, broadcasting reload...");
+                    let _ = run_conf.0.lock().expect("").reload_tx.send(());
+                    folder_existed = true;
+                    continue;
+                }
+
+                // Detect folder deletion
+                if !exists_now && folder_existed {
+                    println!("Presentations folder deleted, broadcasting reload...");
+                    let _ = run_conf.0.lock().expect("").reload_tx.send(());
+                    let mut conf = run_conf.0.lock().expect("");
+                    conf.presentation_version = String::new();
+                    folder_existed = false;
+                    continue;
+                }
+
+                folder_existed = exists_now;
+
+                if !exists_now {
+                    continue;
+                }
+
                 // Re-scan files and check if version changed
                 match get_presentation_files(&presentations_dir) {
                     Ok(files) => {
                         let new_version = compute_version(&files);
                         let mut conf = run_conf.0.lock().expect("Failed to lock config");
 
-                        if !conf.presentation_version.is_empty() && conf.presentation_version != new_version {
+                        if conf.presentation_version != new_version {
                             println!("Presentation files changed, broadcasting reload...");
                             let _ = conf.reload_tx.send(());
                         }
@@ -223,9 +264,37 @@ fn compute_version(files: &OrderMap<String, PresentationFile>) -> String {
 
 // Handler to generate presentation HTML
 async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl IntoResponse {
+    let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
+    let path = Path::new(&presentations_dir);
+
+    // Check if directory exists
+    if !path.exists() {
+        return (
+            [("Content-Type", "text/html; charset=utf-8")],
+            generate_no_folder_html(),
+        )
+            .into_response();
+    }
+
     // Get presentation files from directory
-    match get_presentation_files(&run_conf.0.lock().expect("").presentations_dir) {
+    match get_presentation_files(&presentations_dir) {
         Ok(files) => {
+            // Check if folder is empty (no valid media files)
+            let has_valid_files = files.values().any(|f| f.is_image() || f.is_video());
+
+            if !has_valid_files {
+                // Update version even for empty folder
+                let mut conf = run_conf.0.lock().expect("Failed to lock config");
+                conf.presentation_version = String::new();
+                drop(conf);
+
+                return (
+                    [("Content-Type", "text/html; charset=utf-8")],
+                    generate_empty_folder_html(),
+                )
+                    .into_response();
+            }
+
             // Compute version and check if changed
             let version = compute_version(&files);
             let mut conf = run_conf.0.lock().expect("Failed to lock config");
