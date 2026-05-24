@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Form, State},
+    extract::{Form, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
     response::Redirect,
@@ -10,14 +10,17 @@ use ordermap::OrderMap;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{
+    collections::hash_map::DefaultHasher,
     env,
     error::Error,
     fs,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tokio::join;
+use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 mod cmd;
@@ -35,6 +38,8 @@ struct RunningConfInner {
     presentations_dir: String,
     limiter_on: bool,
     config: Config,
+    presentation_version: String,
+    reload_tx: broadcast::Sender<()>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -88,16 +93,22 @@ async fn main() {
 
     let config = Config {};
 
+    // Create broadcast channel for reload messages
+    let (reload_tx, _) = broadcast::channel(16);
+
     // Build our application with a route
     let app = Router::new()
         .route("/", get(dashboard_handler))
         .route("/presentation", get(generate_html_endpoint))
+        .route("/presentation/ws", get(websocket_handler))
         .route("/settings/limiter", post(limiter_handler))
         .layer(CorsLayer::permissive())
         .with_state(RunningConf(Arc::new(Mutex::new(RunningConfInner {
             presentations_dir: presentations_dir.clone(),
             limiter_on: true,
             config,
+            presentation_version: String::new(),
+            reload_tx: reload_tx.clone(),
         }))))
         .fallback_service(ServeDir::new(&presentations_dir));
 
@@ -123,17 +134,77 @@ async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoRespon
     ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
 }
 
+fn compute_version(files: &OrderMap<String, PresentationFile>) -> String {
+    let mut hasher = DefaultHasher::new();
+    for (key, file) in files.iter() {
+        key.hash(&mut hasher);
+        file.name.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
 // Handler to generate presentation HTML
 async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl IntoResponse {
     // Get presentation files from directory
     match get_presentation_files(&run_conf.0.lock().expect("").presentations_dir) {
         Ok(files) => {
+            // Compute version and check if changed
+            let version = compute_version(&files);
+            let mut conf = run_conf.0.lock().expect("Failed to lock config");
+
+            if !conf.presentation_version.is_empty() && conf.presentation_version != version {
+                // Files changed - notify all connected clients
+                let _ = conf.reload_tx.send(());
+            }
+            conf.presentation_version = version;
+            drop(conf);
+
             let html_content = generate_html(files);
             ([("Content-Type", "text/html; charset=utf-8")], html_content).into_response()
         }
         Err(e) => {
             eprintln!("Error generating presentation HTML: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
+        }
+    }
+}
+
+// WebSocket handler for live reload
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(run_conf): State<RunningConf>,
+) -> impl IntoResponse {
+    let reload_rx = run_conf.0.lock().expect("").reload_tx.subscribe();
+    ws.on_upgrade(move |socket| handle_socket(socket, reload_rx))
+}
+
+async fn handle_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    mut reload_rx: broadcast::Receiver<()>,
+) {
+    use axum::extract::ws::Message;
+
+    loop {
+        tokio::select! {
+            // Wait for reload signal
+            result = reload_rx.recv() => {
+                match result {
+                    Ok(()) => {
+                        // Send reload message to client
+                        if socket.send(Message::Text("reload".into())).await.is_err() {
+                            break; // Client disconnected
+                        }
+                    }
+                    Err(_) => break, // Channel closed
+                }
+            }
+            // Check if client disconnected
+            msg = socket.recv() => {
+                if msg.is_none() {
+                    break; // Client disconnected
+                }
+                // Ignore incoming messages (client doesn't send any)
+            }
         }
     }
 }

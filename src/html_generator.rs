@@ -121,6 +121,52 @@ fn build_reveal_html(slides: &[PresentationFile]) -> String {
                 hash: true,
             });
         </script>
+
+        <script>
+            // WebSocket auto-reload: reconnects and waits for reload signal
+            (function() {
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = wsProtocol + '//' + window.location.host + '/presentation/ws';
+                let ws = null;
+                let reconnectDelay = 1000;
+                const maxReconnectDelay = 30000;
+
+                function connect() {
+                    ws = new WebSocket(wsUrl);
+
+                    ws.onopen = function() {
+                        console.log('Live reload connected');
+                        reconnectDelay = 1000; // Reset delay on successful connection
+                    };
+
+                    ws.onmessage = function(event) {
+                        if (event.data === 'reload') {
+                            console.log('Presentation changed, reloading...');
+                            window.location.reload();
+                        }
+                    };
+
+                    ws.onclose = function() {
+                        console.log('Live reload disconnected, reconnecting in ' + reconnectDelay + 'ms...');
+                        setTimeout(connect, reconnectDelay);
+                        // Exponential backoff with cap
+                        reconnectDelay = Math.min(reconnectDelay * 2, maxReconnectDelay);
+                    };
+
+                    ws.onerror = function(err) {
+                        console.error('Live reload error:', err);
+                        ws.close();
+                    };
+                }
+
+                // Start connection after page load
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', connect);
+                } else {
+                    connect();
+                }
+            })();
+        </script>
     </body>
 </html>"#);
 
