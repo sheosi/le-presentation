@@ -52,7 +52,8 @@ apt-get install -y \
     libssl-dev \
     libasound2-dev \
     libdbus-1-dev \
-    libinotifytools0-dev
+    libinotifytools0-dev \
+    udevil
 
 # Install audio system (PipeWire with WirePlumber)
 echo -e "${GREEN}Installing audio system (PipeWire)...${NC}"
@@ -238,10 +239,35 @@ chmod 700 /run/user/1000
 # Enable lingering for present user (allows services to run without login)
 loginctl enable-linger present || true
 
+# Create devmon automount service for USB drives
+echo -e "${GREEN}Creating USB automount service...${NC}"
+cat > /etc/systemd/system/devmon-automount.service << 'EOF'
+[Unit]
+Description=Devmon Automount Any USB Service
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+# Create mount point if it doesn't exist
+ExecStartPre=/bin/mkdir -p /media/usb-kiosk
+# ExecStart runs devmon, telling it to quietly mount anything plugged in
+ExecStart=/usr/bin/devmon --no-mount --exec-on-drive "udevil mount %%f /media/usb-kiosk && chmod -R 777 /media/usb-kiosk"
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create the mount point
+mkdir -p /media/usb-kiosk
+chmod 777 /media/usb-kiosk
+
 # Reload systemd and enable services
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl enable "$DISPLAY_SERVICE"
+systemctl enable devmon-automount
 
 # Enable NetworkManager
 systemctl enable NetworkManager
