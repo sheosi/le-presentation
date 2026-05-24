@@ -132,6 +132,13 @@ async fn main() {
     println!("Server listening on {}", addr);
     println!("Presentations directory: {}", presentations_dir);
 
+    // Start WiFi hotspot if embedded-device feature is enabled
+    #[cfg(feature = "embedded-device")]
+    {
+        println!("Embedded device mode: Starting WiFi hotspot...");
+        tokio::spawn(start_wifi_hotspot());
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     open_link(&format!("http://localhost:{}/presentation", port));
 
@@ -246,6 +253,98 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
             }
         }
     }
+}
+
+/// Start WiFi hotspot for embedded device mode
+#[cfg(feature = "embedded-device")]
+async fn start_wifi_hotspot() {
+    // Wait a bit for NetworkManager to be ready
+    sleep(Duration::from_secs(2)).await;
+
+    // Check if nmcli is available
+    if app("nmcli").is_none() {
+        eprintln!("WiFi hotspot: nmcli not found. Cannot start hotspot.");
+        return;
+    }
+
+    // Get WiFi interface
+    let interface = match get_wifi_interface().await {
+        Some(iface) => iface,
+        None => {
+            eprintln!("WiFi hotspot: No WiFi interface found");
+            return;
+        }
+    };
+
+    println!("WiFi hotspot: Using interface {}", interface);
+
+    // Generate a simple password based on hostname or use a default
+    let ssid = env::var("HOTSPOT_SSID").unwrap_or_else(|_| "Presentation-Device".to_string());
+    let password = env::var("HOTSPOT_PASSWORD").unwrap_or_else(|_| "present123".to_string());
+
+    // Stop any existing hotspot connection
+    if let Some(mut cmd) = app("nmcli") {
+        cmd.args(["connection", "down", "Hotspot"]);
+        let _ = cmd.status();
+    }
+
+    // Delete old hotspot connection if exists
+    if let Some(mut cmd) = app("nmcli") {
+        cmd.args(["connection", "delete", "Hotspot"]);
+        let _ = cmd.status();
+    }
+
+    // Create and start hotspot
+    println!("WiFi hotspot: Creating hotspot with SSID '{}'...", ssid);
+
+    if let Some(mut cmd) = app("nmcli") {
+        cmd.args([
+            "dev", "wifi", "hotspot", "ifname", &interface, "ssid", &ssid, "password", &password,
+        ]);
+
+        match cmd.status() {
+            Ok(status) if status.success() => {
+                println!("WiFi hotspot: Successfully started!");
+                println!("WiFi hotspot: SSID: {}", ssid);
+                println!("WiFi hotspot: Password: {}", password);
+            }
+            Ok(_) => {
+                eprintln!("WiFi hotspot: Failed to start hotspot");
+            }
+            Err(e) => {
+                eprintln!("WiFi hotspot: Error running nmcli: {}", e);
+            }
+        }
+    }
+}
+
+/// Get the first available WiFi interface
+#[cfg(feature = "embedded-device")]
+async fn get_wifi_interface() -> Option<String> {
+    if let Some(mut cmd) = app("nmcli") {
+        cmd.args(["-t", "-f", "DEVICE,TYPE", "dev", "show"]);
+        if let Ok(output) = cmd.output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // Format: DEVICE:TYPE
+                if line.contains(":wifi") || line.contains(":wireless") {
+                    if let Some(device) = line.split(':').next() {
+                        return Some(device.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: try common interface names
+    for iface in &["wlan0", "wlp2s0", "wlp3s0", "wlp1s0", "wifi0"] {
+        let path = Path::new("/sys/class/net").join(iface);
+        if path.exists() {
+            return Some(iface.to_string());
+        }
+    }
+
+    None
 }
 
 // Handler for dashboard

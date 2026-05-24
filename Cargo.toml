@@ -3,6 +3,9 @@ name = "le-presentation"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+embedded-device = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1.0", features = ["full"] }
