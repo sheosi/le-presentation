@@ -1,4 +1,4 @@
-pub fn main_dashboard(limiter_on: bool) -> String {
+pub fn main_dashboard(limiter_on: bool, volume: Option<u8>) -> String {
     format!(
         r#"<!DOCTYPE html>
         <html lang="es">
@@ -254,6 +254,124 @@ pub fn main_dashboard(limiter_on: bool) -> String {
               margin-top: 0.125rem;
             }}
 
+            /* Volume Card */
+            .volume-card {{
+              display: flex;
+              width: 100%;
+              align-items: center;
+              gap: 0.75rem;
+              padding: 1rem;
+              background: var(--card);
+              border: 1px solid var(--border-dim);
+              border-radius: 0.75rem;
+              transition: border-color 0.15s;
+            }}
+
+            .volume-card:hover {{
+              border-color: var(--accent-border);
+            }}
+
+            .volume-icon-box {{
+              flex-shrink: 0;
+              width: 2.25rem;
+              height: 2.25rem;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              border-radius: var(--radius);
+              background: var(--secondary);
+            }}
+
+            .volume-icon-box svg {{
+              color: var(--muted-fg);
+            }}
+
+            .volume-text {{
+              flex: 1;
+              min-width: 0;
+            }}
+
+            .volume-title {{
+              font-size: 0.875rem;
+              font-weight: 600;
+              color: var(--card-fg);
+              display: block;
+            }}
+
+            .volume-level {{
+              font-size: 0.75rem;
+              color: var(--muted-fg);
+              display: block;
+              margin-top: 0.125rem;
+            }}
+
+            .volume-controls {{
+              display: flex;
+              align-items: center;
+              gap: 0.5rem;
+            }}
+
+            .volume-btn {{
+              width: 2rem;
+              height: 2rem;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              border-radius: var(--radius);
+              background: var(--secondary);
+              border: 1px solid var(--border);
+              color: var(--fg);
+              font-size: 1rem;
+              font-weight: 600;
+              cursor: pointer;
+              transition: background 0.15s, border-color 0.15s;
+            }}
+
+            .volume-btn:hover {{
+              background: rgba(46, 46, 46, 0.8);
+              border-color: var(--accent-border);
+            }}
+
+            .volume-btn:active {{
+              background: var(--accent);
+            }}
+
+            .volume-card.disabled {{
+              opacity: 0.5;
+              pointer-events: none;
+            }}
+
+            .volume-card.disabled .volume-btn {{
+              background: var(--secondary);
+              border-color: var(--border);
+              cursor: not-allowed;
+            }}
+
+            @media (min-width: 640px) {{
+              .volume-card {{
+                gap: 1rem;
+                padding: 1.25rem;
+              }}
+
+              .volume-icon-box {{
+                width: 2.5rem;
+                height: 2.5rem;
+              }}
+
+              .volume-title {{
+                font-size: 1rem;
+              }}
+
+              .volume-level {{
+                font-size: 0.875rem;
+              }}
+
+              .volume-btn {{
+                width: 2.25rem;
+                height: 2.25rem;
+              }}
+            }}
+
             /* Toggle switch */
             .toggle {{
               flex-shrink: 0;
@@ -400,6 +518,31 @@ pub fn main_dashboard(limiter_on: bool) -> String {
 
             <!-- Settings -->
             <div class="settings-list">
+              <!-- Volume Control -->
+              <div class="volume-card {}">
+                <div class="volume-icon-box">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                  </svg>
+                </div>
+                <div class="volume-text">
+                  <span class="volume-title">Volumen</span>
+                  <span class="volume-level">{}% - {}</span>
+                </div>
+                <div class="volume-controls">
+                  <form method="POST" action="/settings/volume" style="display:inline;">
+                    <input type="hidden" name="direction" value="down">
+                    <button type="submit" class="volume-btn" aria-label="Bajar volumen" {}>-</button>
+                  </form>
+                  <form method="POST" action="/settings/volume" style="display:inline;">
+                    <input type="hidden" name="direction" value="up">
+                    <button type="submit" class="volume-btn" aria-label="Subir volumen" {}>+</button>
+                  </form>
+                </div>
+              </div>
+
               <button type="button" class="limiter-card" id="limiterCard" aria-pressed="{}">
                 <div class="limiter-icon-box">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -445,6 +588,15 @@ pub fn main_dashboard(limiter_on: bool) -> String {
           </script>
         </body>
         </html>"#,
+        if volume.is_none() { "disabled" } else { "" },
+        volume.unwrap_or(0),
+        if volume.is_some() {
+            "Nivel de salida de audio"
+        } else {
+            "Control de volumen no disponible"
+        },
+        if volume.is_none() { "disabled" } else { "" },
+        if volume.is_none() { "disabled" } else { "" },
         if limiter_on { "true" } else { "false" },
         if limiter_on { "active" } else { "" },
         if limiter_on { "checked" } else { "" }

@@ -117,6 +117,7 @@ async fn main() {
         .route("/presentation", get(generate_html_endpoint))
         .route("/presentation/ws", get(websocket_handler))
         .route("/settings/limiter", post(limiter_handler))
+        .route("/settings/volume", post(volume_handler))
         .layer(CorsLayer::permissive())
         .with_state(run_conf.clone())
         .fallback_service(ServeDir::new(&presentations_dir));
@@ -249,8 +250,15 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
 
 // Handler for dashboard
 async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoResponse {
-    let html = dashboard::main_dashboard(config.0.lock().expect("").limiter_on);
+    let limiter_on = config.0.lock().expect("").limiter_on;
+    let volume = get_current_volume();
+    let html = dashboard::main_dashboard(limiter_on, volume);
     ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
+}
+
+/// Check if volume control is available
+fn volume_control_available() -> bool {
+    app("wpctl").is_some() || app("pactl").is_some()
 }
 
 fn compute_version(files: &OrderMap<String, PresentationFile>) -> String {
@@ -524,6 +532,82 @@ fn is_media_file(filename: &str) -> bool {
     )
 }
 
+/// Get current volume percentage using wpctl (PipeWire/WirePlumber) or pactl (PulseAudio/PipeWire compat)
+/// Returns None if no volume control tool is available
+fn get_current_volume() -> Option<u8> {
+    // Try wpctl first (PipeWire native)
+    if app("wpctl").is_some() {
+        if let Some(mut cmd) = app("wpctl") {
+            cmd.args(["get-volume", "@DEFAULT_AUDIO_SINK@"]);
+            if let Ok(output) = cmd.output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Parse "Volume: 0.75" format
+                if let Some(vol) = stdout
+                    .lines()
+                    .find(|l| l.contains("Volume:"))
+                    .and_then(|l| {
+                        l.split_whitespace()
+                            .last()
+                            .and_then(|v| v.parse::<f32>().ok())
+                    })
+                    .map(|v| (v * 100.0) as u8)
+                {
+                    return Some(vol);
+                }
+            }
+        }
+    }
+
+    // Fallback to pactl (PulseAudio/PipeWire compatibility)
+    if app("pactl").is_some() {
+        if let Some(mut cmd) = app("pactl") {
+            cmd.args(["list", "sinks"]);
+            if let Ok(output) = cmd.output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Find the default sink and extract volume percentage
+                for line in stdout.lines() {
+                    if line.contains("Volume:") && line.contains('%') {
+                        // Parse "Volume: front-left: 65536 / 100% / 0.00 dB,..."
+                        if let Some(percent_start) = line.find('/') {
+                            let after_slash = &line[percent_start + 1..];
+                            if let Some(percent_end) = after_slash.find('%') {
+                                if let Ok(vol) = after_slash[..percent_end].trim().parse::<u8>() {
+                                    return Some(vol);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None // No volume control available
+}
+
+/// Set volume up or down by 5%
+fn change_volume(direction: &str) {
+    let (wpctl_change, pactl_change) = match direction {
+        "up" => ("5%+", "+5%"),
+        "down" => ("5%-", "-5%"),
+        _ => return,
+    };
+
+    // Try wpctl first (PipeWire native)
+    if let Some(mut cmd) = app("wpctl") {
+        cmd.args(["set-volume", "@DEFAULT_AUDIO_SINK@", wpctl_change]);
+        if cmd.status().map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+    }
+
+    // Fallback to pactl (PulseAudio/PipeWire compatibility)
+    if let Some(mut cmd) = app("pactl") {
+        cmd.args(["set-sink-volume", "@DEFAULT_SINK@", pactl_change]);
+        let _ = cmd.status();
+    }
+}
+
 #[derive(Deserialize)]
 struct LimiterQuery {
     enable: Option<String>,
@@ -545,6 +629,23 @@ async fn limiter_handler(
             a.args(["run", "com.github.wwmm.easyeffects", "-b", "1"]);
             a
         }));
+    }
+    Redirect::to("/")
+}
+
+#[derive(Deserialize)]
+struct VolumeQuery {
+    direction: String,
+}
+
+async fn volume_handler(Form(query): Form<VolumeQuery>) -> impl IntoResponse {
+    // Only change volume if control is available
+    if volume_control_available() {
+        match query.direction.as_str() {
+            "up" => change_volume("up"),
+            "down" => change_volume("down"),
+            _ => {}
+        }
     }
     Redirect::to("/")
 }
