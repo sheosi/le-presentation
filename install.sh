@@ -3,6 +3,9 @@
 # Installation script for Presentation System on Debian base (no GUI)
 # Creates a locked-down kiosk system with Cage + Chromium
 #
+# This script clones and builds from: https://github.com/sheosi/le-presentation
+# Internet connection required for installation
+#
 
 set -e
 
@@ -121,15 +124,17 @@ mkdir -p "/home/$PRESENT_USER/.config"
 echo "PRESENTATIONS_DIR=$PRESENT_DIR" > "/home/$PRESENT_USER/.config/presentation.env"
 chown -R "$PRESENT_USER:$PRESENT_USER" "/home/$PRESENT_USER/.config"
 
-# Build the presentation server
-echo -e "${GREEN}Building presentation server...${NC}"
+# Clone and build the presentation server
+echo -e "${GREEN}Cloning presentation server from GitHub...${NC}"
 if [ -d "/opt/le-presentation" ]; then
     rm -rf /opt/le-presentation
 fi
 
-# Copy source to /opt
-cp -r "$(dirname "$0")" /opt/le-presentation
+# Clone from GitHub
+git clone https://github.com/sheosi/le-presentation.git /opt/le-presentation
 cd /opt/le-presentation
+
+echo -e "${GREEN}Building presentation server...${NC}"
 
 # Build with embedded-device feature
 if command -v cargo &> /dev/null || [ -f "$HOME/.cargo/bin/cargo" ]; then
