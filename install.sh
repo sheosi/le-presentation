@@ -202,7 +202,7 @@ chmod +x /usr/local/bin/presentation-browser
 
 # Create systemd service for Cage + Chromium display
 echo -e "${GREEN}Creating display service: $DISPLAY_SERVICE${NC}"
-cat > "/etc/systemd/system/${DISPLAY_SERVICE}.service" << EOF
+cat > "/etc/systemd/system/${DISPLAY_SERVICE}.service" << 'EOF'
 [Unit]
 Description=Presentation Display (Cage + Chromium)
 After=presentation-server.service pipewire.service
@@ -210,8 +210,8 @@ Requires=presentation-server.service
 
 [Service]
 Type=simple
-User=$PRESENT_USER
-Group=$PRESENT_USER
+User=present
+Group=present
 Environment="WLR_BACKENDS=drm"
 Environment="WLR_DRM_DEVICES=/dev/dri/card0"
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
