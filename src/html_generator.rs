@@ -182,14 +182,19 @@ mod tests {
 
     #[test]
     fn test_html_generation() {
-        let files = vec![
+        let mut files = OrderMap::new();
+        files.insert(
+            "PRESENTACION 1.0.png".to_string(),
             PresentationFile {
                 name: "PRESENTACION-1.0.png".to_string(),
             },
+        );
+        files.insert(
+            "PRESENTACION-1.1.mp4".to_string(),
             PresentationFile {
                 name: "PRESENTACION-1.1.mp4".to_string(),
             },
-        ];
+        );
 
         let html = generate_html(files);
         assert!(html.contains(r#"data-background-image="PRESENTACION-1.0.png""#));
