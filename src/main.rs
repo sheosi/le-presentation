@@ -6,9 +6,12 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use notify::Config as NotifyConfig;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use ordermap::OrderMap;
 use serde::Deserialize;
 use serde::Serialize;
+use std::time::Duration;
 use std::{
     collections::hash_map::DefaultHasher,
     env,
@@ -21,6 +24,7 @@ use std::{
 };
 use tokio::join;
 use tokio::sync::broadcast;
+use tokio::time::sleep;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 mod cmd;
@@ -96,6 +100,15 @@ async fn main() {
     // Create broadcast channel for reload messages
     let (reload_tx, _) = broadcast::channel(16);
 
+    // Create shared state
+    let run_conf = RunningConf(Arc::new(Mutex::new(RunningConfInner {
+        presentations_dir: presentations_dir.clone(),
+        limiter_on: true,
+        config,
+        presentation_version: String::new(),
+        reload_tx: reload_tx.clone(),
+    })));
+
     // Build our application with a route
     let app = Router::new()
         .route("/", get(dashboard_handler))
@@ -103,13 +116,7 @@ async fn main() {
         .route("/presentation/ws", get(websocket_handler))
         .route("/settings/limiter", post(limiter_handler))
         .layer(CorsLayer::permissive())
-        .with_state(RunningConf(Arc::new(Mutex::new(RunningConfInner {
-            presentations_dir: presentations_dir.clone(),
-            limiter_on: true,
-            config,
-            presentation_version: String::new(),
-            reload_tx: reload_tx.clone(),
-        }))))
+        .with_state(run_conf.clone())
         .fallback_service(ServeDir::new(&presentations_dir));
 
     // Run the server
@@ -124,8 +131,79 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     open_link(&format!("http://localhost:{}/presentation", port));
+
+    // Spawn file watcher task
+    tokio::spawn(watch_presentations_dir(run_conf.clone()));
+
     let (server_res, _) = join!(axum::serve(listener, app), load_easy_effects());
     server_res.unwrap();
+}
+
+/// Watch the presentations directory for changes and broadcast reloads
+async fn watch_presentations_dir(run_conf: RunningConf) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                // Only care about file creation/removal/modification
+                match event.kind {
+                    notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+                    | notify::EventKind::Modify(_) => {
+                        let _ = tx.try_send(());
+                    }
+                    _ => {}
+                }
+            }
+        },
+        NotifyConfig::default().with_poll_interval(Duration::from_millis(500)),
+    )
+    .expect("Failed to create file watcher");
+
+    watcher
+        .watch(Path::new(&presentations_dir), RecursiveMode::NonRecursive)
+        .expect("Failed to watch presentations directory");
+
+    println!(
+        "Watching presentations directory for changes: {}",
+        presentations_dir
+    );
+
+    // Debounce: wait for changes to settle before reloading
+    let mut pending_reload = false;
+    let debounce_duration = Duration::from_millis(500);
+
+    loop {
+        tokio::select! {
+            // Wait for file system events
+            _ = rx.recv() => {
+                pending_reload = true;
+            }
+            // Debounce timer
+            _ = sleep(debounce_duration), if pending_reload => {
+                pending_reload = false;
+
+                // Re-scan files and check if version changed
+                match get_presentation_files(&presentations_dir) {
+                    Ok(files) => {
+                        let new_version = compute_version(&files);
+                        let mut conf = run_conf.0.lock().expect("Failed to lock config");
+
+                        if !conf.presentation_version.is_empty() && conf.presentation_version != new_version {
+                            println!("Presentation files changed, broadcasting reload...");
+                            let _ = conf.reload_tx.send(());
+                        }
+                        conf.presentation_version = new_version;
+                    }
+                    Err(e) => {
+                        eprintln!("Error scanning presentations: {}", e);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Handler for dashboard
