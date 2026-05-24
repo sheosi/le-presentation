@@ -35,7 +35,9 @@ use html_generator::generate_html;
 use html_generator::generate_no_folder_html;
 use html_generator::PresentationFile;
 
-use crate::cmd::{app, open_link, try_run};
+#[cfg(not(feature = "embedded-device"))]
+use crate::cmd::open_link;
+use crate::cmd::{app, try_run};
 
 #[derive(Clone)]
 struct RunningConf(Arc<Mutex<RunningConfInner>>);
@@ -86,12 +88,21 @@ async fn main() {
     load_env();
 
     // Get presentations directory
+    // In embedded-device mode, default to /media/usb-kiosk for USB auto-mount
+    #[cfg(feature = "embedded-device")]
+    let default_dir = "/media/usb-kiosk".to_string();
+    #[cfg(not(feature = "embedded-device"))]
+    let default_dir = std::env::current_dir()
+        .expect("Failed to get current dir")
+        .to_string_lossy()
+        .to_string();
+
     let presentations_dir = env::var("PRESENTATIONS_DIR").unwrap_or_else(|_| {
+        #[cfg(feature = "embedded-device")]
+        println!("PRESENTATIONS_DIR not set, using /media/usb-kiosk (embedded-device mode)");
+        #[cfg(not(feature = "embedded-device"))]
         println!("PRESENTATIONS_DIR not set, using current directory");
-        std::env::current_dir()
-            .expect("Failed to get current dir")
-            .to_string_lossy()
-            .to_string()
+        default_dir
     });
 
     // Create presentations directory if it doesn't exist
@@ -140,6 +151,10 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    // Only open browser automatically in non-embedded mode
+    // In embedded-device mode, Cage is already handling the display
+    #[cfg(not(feature = "embedded-device"))]
     open_link(&format!("http://localhost:{}/presentation", port));
 
     // Spawn file watcher task

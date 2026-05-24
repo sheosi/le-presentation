@@ -3,6 +3,7 @@ use std::{
     process::Command,
 };
 
+#[cfg(not(feature = "embedded-device"))]
 pub fn xdg_open(target: &str) -> Option<Command> {
     let mut x = app("xdg-open");
     x.as_mut().map(|c| c.arg(target));
@@ -39,6 +40,7 @@ fn path_files() -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(not(feature = "embedded-device"))]
 pub fn open_link(link: &str) {
     try_run(xdg_open(link))
 }
