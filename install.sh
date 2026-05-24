@@ -107,7 +107,7 @@ fi
 # Create dedicated user
 echo -e "${GREEN}Creating user account: $PRESENT_USER${NC}"
 if ! id "$PRESENT_USER" &>/dev/null; then
-    useradd -m -s /bin/bash -G video,audio,netdev,flatpak "$PRESENT_USER"
+    useradd -m -s /bin/bash -G video,audio,netdev "$PRESENT_USER"
     # Disable password login (can be changed later if needed)
     passwd -l "$PRESENT_USER"
 else
