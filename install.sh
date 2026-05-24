@@ -171,30 +171,15 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Create systemd service for Cage + Chromium display
-echo -e "${GREEN}Creating display service: $DISPLAY_SERVICE${NC}"
-cat > "/etc/systemd/system/${DISPLAY_SERVICE}.service" << 'EOF'
-[Unit]
-Description=Presentation Display (Cage + Chromium)
-After=presentation-server.service pipewire.service
-Requires=presentation-server.service
+# Create Chromium wrapper script
+cat > /usr/local/bin/presentation-browser << 'EOF'
+#!/bin/bash
+# Wrapper script for Chromium in kiosk mode
 
-[Service]
-Type=simple
-User=present
-Group=present
-Environment="WLR_BACKENDS=drm"
-Environment="WLR_DRM_DEVICES=/dev/dri/card0"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
-Environment="XDG_SESSION_TYPE=wayland"
-Environment="DISPLAY=:0"
+export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_SESSION_TYPE=wayland
 
-# Wait for server to be ready
-ExecStartPre=/bin/sleep 5
-
-# Start Cage with Chromium in kiosk mode
-# -- unsets WAYLAND_DISPLAY to prevent Chromium from trying to use existing compositor
-ExecStart=/usr/bin/cage -- /usr/bin/chromium \
+/usr/bin/chromium \
     --kiosk \
     --app=http://localhost:8080/presentation \
     --no-first-run \
@@ -204,13 +189,39 @@ ExecStart=/usr/bin/cage -- /usr/bin/chromium \
     --disable-features=TranslateUI \
     --disable-pinch \
     --overscroll-history-navigation=0 \
-    --disable-gesture-typing \
-    --disable-features=IsolateOrigins,site-per-process \
     --autoplay-policy=no-user-gesture-required \
     --enable-features=WebRTC \
     --window-size=1920,1080 \
     --window-position=0,0 \
-    --start-fullscreen
+    --start-fullscreen \
+    --check-for-update-interval=31536000 \
+    --disable-component-update
+EOF
+
+chmod +x /usr/local/bin/presentation-browser
+
+# Create systemd service for Cage + Chromium display
+echo -e "${GREEN}Creating display service: $DISPLAY_SERVICE${NC}"
+cat > "/etc/systemd/system/${DISPLAY_SERVICE}.service" << EOF
+[Unit]
+Description=Presentation Display (Cage + Chromium)
+After=presentation-server.service pipewire.service
+Requires=presentation-server.service
+
+[Service]
+Type=simple
+User=$PRESENT_USER
+Group=$PRESENT_USER
+Environment="WLR_BACKENDS=drm"
+Environment="WLR_DRM_DEVICES=/dev/dri/card0"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="XDG_SESSION_TYPE=wayland"
+
+# Wait for server to be ready
+ExecStartPre=/bin/sleep 5
+
+# Start Cage with the wrapper script
+ExecStart=/usr/bin/cage -- /usr/local/bin/presentation-browser
 
 Restart=always
 RestartSec=10

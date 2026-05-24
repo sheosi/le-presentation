@@ -4,7 +4,7 @@ A presentation management server built with Rust and Axum.
 
 ## Installation
 
-```curl -f https://raw.githubusercontent.com/sheosi/le-presentation/main/install.sh | sudo bash``
+```curl -f https://raw.githubusercontent.com/sheosi/le-presentation/main/install.sh | sudo bash```
 
 
 ## Features
