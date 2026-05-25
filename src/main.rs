@@ -11,7 +11,6 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use ordermap::OrderMap;
 use serde::Deserialize;
 use serde::Serialize;
-use std::time::Duration;
 use std::{
     collections::hash_map::DefaultHasher,
     env,
@@ -21,7 +20,9 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+use sysinfo::Disks;
 use tokio::join;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
@@ -164,6 +165,122 @@ async fn main() {
     server_res.unwrap();
 }
 
+/// Check if volume control is available
+fn volume_control_available() -> bool {
+    app("wpctl").is_some() || app("pactl").is_some()
+}
+
+fn compute_version(files: &OrderMap<String, PresentationFile>) -> String {
+    let mut hasher = DefaultHasher::new();
+    for (key, file) in files.iter() {
+        key.hash(&mut hasher);
+        file.name.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
+// Handler to generate presentation HTML
+async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl IntoResponse {
+    let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
+    let path = Path::new(&presentations_dir);
+
+    // Check if directory exists
+    if !path.exists() {
+        return (
+            [("Content-Type", "text/html; charset=utf-8")],
+            generate_no_folder_html(),
+        )
+            .into_response();
+    }
+
+    // Get presentation files from directory
+    match get_presentation_files(&presentations_dir) {
+        Ok(files) => {
+            // Check if folder is empty (no valid media files)
+            let has_valid_files = files.values().any(|f| f.is_image() || f.is_video());
+
+            if !has_valid_files {
+                // Update version even for empty folder
+                let mut conf = run_conf.0.lock().expect("Failed to lock config");
+                conf.presentation_version = String::new();
+                drop(conf);
+
+                return (
+                    [("Content-Type", "text/html; charset=utf-8")],
+                    generate_empty_folder_html(),
+                )
+                    .into_response();
+            }
+
+            // Compute version and check if changed
+            let version = compute_version(&files);
+            let mut conf = run_conf.0.lock().expect("Failed to lock config");
+
+            if !conf.presentation_version.is_empty() && conf.presentation_version != version {
+                // Files changed - notify all connected clients
+                let _ = conf.reload_tx.send(());
+            }
+            conf.presentation_version = version;
+            drop(conf);
+
+            let html_content = generate_html(files);
+            ([("Content-Type", "text/html; charset=utf-8")], html_content).into_response()
+        }
+        Err(e) => {
+            eprintln!("Error generating presentation HTML: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
+        }
+    }
+}
+
+// WebSocket handler for live reload
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(run_conf): State<RunningConf>,
+) -> impl IntoResponse {
+    let reload_rx = run_conf.0.lock().expect("").reload_tx.subscribe();
+    ws.on_upgrade(move |socket| handle_socket(socket, reload_rx))
+}
+
+async fn handle_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    mut reload_rx: broadcast::Receiver<()>,
+) {
+    use axum::extract::ws::Message;
+
+    loop {
+        tokio::select! {
+            // Wait for reload signal
+            result = reload_rx.recv() => {
+                match result {
+                    Ok(()) => {
+                        // Send reload message to client
+                        if socket.send(Message::Text("reload".into())).await.is_err() {
+                            break; // Client disconnected
+                        }
+                    }
+                    Err(_) => break, // Channel closed
+                }
+            }
+            // Check if client disconnected
+            msg = socket.recv() => {
+                if msg.is_none() {
+                    break; // Client disconnected
+                }
+                // Ignore incoming messages (client doesn't send any)
+            }
+        }
+    }
+}
+
+// Handler for dashboard
+async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoResponse {
+    let limiter_on = config.0.lock().expect("").limiter_on;
+    let volume = get_current_volume();
+    let html = dashboard::main_dashboard(limiter_on, volume);
+    ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
+}
+
 /// Watch the presentations directory for changes and broadcast reloads
 async fn watch_presentations_dir(run_conf: RunningConf) {
     let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
@@ -209,8 +326,12 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
     let mut pending_reload = false;
     let debounce_duration = Duration::from_millis(500);
 
-    // Track previous state to detect folder creation/deletion
-    let mut folder_existed = true;
+    // Track previous state to detect folder creation/deletion/mount/unmount
+    let mut folder_accessible = true;
+    let mut last_file_count: Option<usize> = None;
+
+    // Helper to check if directory is accessible (not just exists)
+    let is_accessible = |path: &Path| path.exists() && fs::read_dir(path).is_ok();
 
     loop {
         tokio::select! {
@@ -218,34 +339,53 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
             _ = rx.recv() => {
                 pending_reload = true;
             }
+            // Periodic poll every 3 seconds to detect mount/unmount using sysinfo
+            _ = sleep(Duration::from_secs(3)) => {
+                // Check if the mount point has a filesystem using sysinfo
+                let disks = Disks::new_with_refreshed_list();
+                let path_str = presentations_dir.as_str();
+                let is_mounted = disks.iter().any(|disk| {
+                    disk.mount_point().to_string_lossy() == path_str
+                });
+
+                if is_mounted != folder_accessible {
+                    if is_mounted {
+                        println!("Sysinfo detected mount at {}, broadcasting reload...", presentations_dir);
+                    } else {
+                        println!("Sysinfo detected unmount at {}, broadcasting reload...", presentations_dir);
+                    }
+                    let _ = run_conf.0.lock().expect("").reload_tx.send(());
+                    folder_accessible = is_mounted;
+                }
+            }
             // Debounce timer
             _ = sleep(debounce_duration), if pending_reload => {
                 pending_reload = false;
 
                 let path = Path::new(&presentations_dir);
-                let exists_now = path.exists();
+                let accessible_now = is_accessible(path);
 
-                // Detect folder creation
-                if exists_now && !folder_existed {
-                    println!("Presentations folder created, broadcasting reload...");
+                // Detect folder becoming accessible (created or mounted)
+                if accessible_now && !folder_accessible {
+                    println!("Presentations folder became accessible (mounted), broadcasting reload...");
                     let _ = run_conf.0.lock().expect("").reload_tx.send(());
-                    folder_existed = true;
+                    folder_accessible = true;
                     continue;
                 }
 
-                // Detect folder deletion
-                if !exists_now && folder_existed {
-                    println!("Presentations folder deleted, broadcasting reload...");
+                // Detect folder becoming inaccessible (deleted or unmounted)
+                if !accessible_now && folder_accessible {
+                    println!("Presentations folder became inaccessible (unmounted), broadcasting reload...");
                     let _ = run_conf.0.lock().expect("").reload_tx.send(());
                     let mut conf = run_conf.0.lock().expect("");
                     conf.presentation_version = String::new();
-                    folder_existed = false;
+                    folder_accessible = false;
                     continue;
                 }
 
-                folder_existed = exists_now;
+                folder_accessible = accessible_now;
 
-                if !exists_now {
+                if !accessible_now {
                     continue;
                 }
 
@@ -360,122 +500,6 @@ async fn get_wifi_interface() -> Option<String> {
     }
 
     None
-}
-
-// Handler for dashboard
-async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoResponse {
-    let limiter_on = config.0.lock().expect("").limiter_on;
-    let volume = get_current_volume();
-    let html = dashboard::main_dashboard(limiter_on, volume);
-    ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
-}
-
-/// Check if volume control is available
-fn volume_control_available() -> bool {
-    app("wpctl").is_some() || app("pactl").is_some()
-}
-
-fn compute_version(files: &OrderMap<String, PresentationFile>) -> String {
-    let mut hasher = DefaultHasher::new();
-    for (key, file) in files.iter() {
-        key.hash(&mut hasher);
-        file.name.hash(&mut hasher);
-    }
-    format!("{:x}", hasher.finish())
-}
-
-// Handler to generate presentation HTML
-async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl IntoResponse {
-    let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
-    let path = Path::new(&presentations_dir);
-
-    // Check if directory exists
-    if !path.exists() {
-        return (
-            [("Content-Type", "text/html; charset=utf-8")],
-            generate_no_folder_html(),
-        )
-            .into_response();
-    }
-
-    // Get presentation files from directory
-    match get_presentation_files(&presentations_dir) {
-        Ok(files) => {
-            // Check if folder is empty (no valid media files)
-            let has_valid_files = files.values().any(|f| f.is_image() || f.is_video());
-
-            if !has_valid_files {
-                // Update version even for empty folder
-                let mut conf = run_conf.0.lock().expect("Failed to lock config");
-                conf.presentation_version = String::new();
-                drop(conf);
-
-                return (
-                    [("Content-Type", "text/html; charset=utf-8")],
-                    generate_empty_folder_html(),
-                )
-                    .into_response();
-            }
-
-            // Compute version and check if changed
-            let version = compute_version(&files);
-            let mut conf = run_conf.0.lock().expect("Failed to lock config");
-
-            if !conf.presentation_version.is_empty() && conf.presentation_version != version {
-                // Files changed - notify all connected clients
-                let _ = conf.reload_tx.send(());
-            }
-            conf.presentation_version = version;
-            drop(conf);
-
-            let html_content = generate_html(files);
-            ([("Content-Type", "text/html; charset=utf-8")], html_content).into_response()
-        }
-        Err(e) => {
-            eprintln!("Error generating presentation HTML: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
-        }
-    }
-}
-
-// WebSocket handler for live reload
-async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(run_conf): State<RunningConf>,
-) -> impl IntoResponse {
-    let reload_rx = run_conf.0.lock().expect("").reload_tx.subscribe();
-    ws.on_upgrade(move |socket| handle_socket(socket, reload_rx))
-}
-
-async fn handle_socket(
-    mut socket: axum::extract::ws::WebSocket,
-    mut reload_rx: broadcast::Receiver<()>,
-) {
-    use axum::extract::ws::Message;
-
-    loop {
-        tokio::select! {
-            // Wait for reload signal
-            result = reload_rx.recv() => {
-                match result {
-                    Ok(()) => {
-                        // Send reload message to client
-                        if socket.send(Message::Text("reload".into())).await.is_err() {
-                            break; // Client disconnected
-                        }
-                    }
-                    Err(_) => break, // Channel closed
-                }
-            }
-            // Check if client disconnected
-            msg = socket.recv() => {
-                if msg.is_none() {
-                    break; // Client disconnected
-                }
-                // Ignore incoming messages (client doesn't send any)
-            }
-        }
-    }
 }
 
 // Helper function to get presentation files for HTML generation
