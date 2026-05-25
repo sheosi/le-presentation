@@ -385,6 +385,31 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin $PRESENT_USER --noclear %I \$TERM
 EOF
 
+
+# Configure WirePlumber Automatic Jack Switching Priority
+echo "=== Configuring Audio Routing Policies ==="
+mkdir -p /etc/wireplumber/wireplumber.conf.d/
+
+cat > /etc/wireplumber/wireplumber.conf.d/10-kiosk-audio.conf << 'EOF'
+monitor.alsa.rules = [
+  {
+    matches = [
+      {
+        # Match your internal headphone jack hardware node
+        node.name = "~alsa_output.*.headphones"
+      }
+    ]
+    actions = {
+      update-properties = {
+        # Set headphone priority higher than HDMI (which defaults to around 60-80)
+        priority.driver = 1500
+        priority.session = 1500
+      }
+    }
+  }
+]
+EOF
+
 # Create a README for the user
 cat > "/home/$PRESENT_USER/README.txt" << EOF
 Presentation System

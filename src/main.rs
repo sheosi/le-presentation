@@ -24,6 +24,7 @@ use std::{
 };
 use sysinfo::Disks;
 use tokio::join;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -114,6 +115,9 @@ async fn main() {
     // Create broadcast channel for reload messages
     let (reload_tx, _) = broadcast::channel(16);
 
+    // Create shutdown channel for graceful shutdown
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+
     // Create shared state
     let run_conf = RunningConf(Arc::new(Mutex::new(RunningConfInner {
         presentations_dir: presentations_dir.clone(),
@@ -158,11 +162,41 @@ async fn main() {
     #[cfg(not(feature = "embedded-device"))]
     open_link(&format!("http://localhost:{}/presentation", port));
 
-    // Spawn file watcher task
-    tokio::spawn(watch_presentations_dir(run_conf.clone()));
+    // Spawn file watcher task with shutdown channel
+    tokio::spawn(watch_presentations_dir(
+        run_conf.clone(),
+        shutdown_tx.subscribe(),
+    ));
 
-    let (server_res, _) = join!(axum::serve(listener, app), load_easy_effects());
-    server_res.unwrap();
+    // Set up signal handlers for graceful shutdown
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to create SIGINT handler");
+
+    // Run server with graceful shutdown
+    tokio::select! {
+        // Run the server
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                eprintln!("Server error: {}", e);
+            }
+        }
+        // Wait for shutdown signal
+        _ = sigterm.recv() => {
+            println!("Received SIGTERM, shutting down gracefully...");
+        }
+        _ = sigint.recv() => {
+            println!("Received SIGINT, shutting down gracefully...");
+        }
+        // Wait for shutdown from file watcher or other components
+        _ = shutdown_rx.recv() => {
+            println!("Received shutdown signal...");
+        }
+    }
+
+    // Send shutdown signal to all components
+    let _ = shutdown_tx.send(());
+
+    println!("Shutdown complete");
 }
 
 /// Check if volume control is available
@@ -282,13 +316,20 @@ async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoRespon
 }
 
 /// Watch the presentations directory for changes and broadcast reloads
-async fn watch_presentations_dir(run_conf: RunningConf) {
+async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast::Receiver<()>) {
     let presentations_dir = run_conf.0.lock().expect("").presentations_dir.clone();
 
     // Wait for directory to exist
     let path = Path::new(&presentations_dir);
     while !path.exists() {
-        sleep(Duration::from_secs(2)).await;
+        // Check for shutdown while waiting
+        tokio::select! {
+            _ = shutdown.recv() => {
+                println!("File watcher received shutdown signal during startup");
+                return;
+            }
+            _ = sleep(Duration::from_secs(2)) => {}
+        }
     }
 
     // Now set up the watcher
@@ -328,7 +369,6 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
 
     // Track previous state to detect folder creation/deletion/mount/unmount
     let mut folder_accessible = true;
-    let mut last_file_count: Option<usize> = None;
 
     // Helper to check if directory is accessible (not just exists)
     let is_accessible = |path: &Path| path.exists() && fs::read_dir(path).is_ok();
@@ -338,6 +378,11 @@ async fn watch_presentations_dir(run_conf: RunningConf) {
             // Wait for file system events
             _ = rx.recv() => {
                 pending_reload = true;
+            }
+            // Check for shutdown signal
+            _ = shutdown.recv() => {
+                println!("File watcher shutting down...");
+                return;
             }
             // Periodic poll every 3 seconds to detect mount/unmount using sysinfo
             _ = sleep(Duration::from_secs(3)) => {
