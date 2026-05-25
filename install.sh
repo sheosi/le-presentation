@@ -53,7 +53,7 @@ apt-get install -y \
     libasound2-dev \
     libdbus-1-dev \
     libinotifytools0-dev \
-    udevil
+    ntfs-3g
 
 # Install audio system (PipeWire with WirePlumber)
 echo -e "${GREEN}Installing audio system (PipeWire)...${NC}"
@@ -239,35 +239,82 @@ chmod 700 /run/user/1000
 # Enable lingering for present user (allows services to run without login)
 loginctl enable-linger present || true
 
-# Create devmon automount service for USB drives
-echo -e "${GREEN}Creating USB automount service...${NC}"
-cat > /etc/systemd/system/devmon-automount.service << 'EOF'
+echo "=== Starting Kiosk USB Mounter Deployment ==="
+
+# 1. Create target directories
+echo "Creating directory structures..."
+mkdir -p /opt/kiosk
+mkdir -p /media/usb-kiosk
+
+# 2. Deploy the mounting script
+echo "Writing mounting script to /opt/kiosk/mount-usb.sh..."
+cat << 'EOF' > /opt/kiosk/mount-usb.sh
+#!/bin/bash
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+LOG_FILE="/var/log/usb-kiosk.log"
+TARGET="/media/usb-kiosk"
+
+echo "=== Script triggered at $(date) ===" >> "$LOG_FILE"
+/bin/mkdir -p "$TARGET"
+
+# Find the USB device partition
+USB_DEV=$(/bin/ls -d /dev/disk/by-id/usb-*-part* 2>/dev/null | /usr/bin/head -n 1)
+echo "Detected USB device path: $USB_DEV" >> "$LOG_FILE"
+
+if [ -n "$USB_DEV" ]; then
+    echo "Executing systemd-mount command..." >> "$LOG_FILE"
+
+    # Unmount old instances safely
+    /bin/systemd-mount --umount "$TARGET" >> "$LOG_FILE" 2>&1
+
+    # Force a global system mount transcending all service sandboxes
+    if /bin/systemd-mount --options="nofail,rw,users,umask=000" "$USB_DEV" "$TARGET" >> "$LOG_FILE" 2>&1; then
+        echo "SUCCESS: Global systemd-mount executed!" >> "$LOG_FILE"
+    else
+        echo "ERROR: systemd-mount failed with exit code $?" >> "$LOG_FILE"
+    fi
+else
+    echo "FAILED: No USB drive resolved." >> "$LOG_FILE"
+fi
+EOF
+
+# 3. Deploy the systemd service wrapper
+echo "Writing systemd service file..."
+cat << 'EOF' > /etc/systemd/system/usb-kiosk-mount.service
 [Unit]
-Description=Devmon Automount Any USB Service
-After=systemd-modules-load.service
+Description=Kiosk USB Mounter Execution Service
 
 [Service]
 Type=simple
-# Create mount point if it doesn't exist
-ExecStartPre=/bin/mkdir -p /media/usb-kiosk
-# ExecStart runs devmon, telling it to quietly mount anything plugged in
-ExecStart=/usr/bin/devmon --no-mount --exec-on-drive "udevil mount %%f /media/usb-kiosk && chmod -R 777 /media/usb-kiosk"
-Restart=always
-User=root
+ExecStart=/opt/kiosk/mount-usb.sh
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Create the mount point
-mkdir -p /media/usb-kiosk
-chmod 777 /media/usb-kiosk
+# 4. Deploy the udev rule linking the hotplug to the service
+echo "Writing udev rule configuration..."
+cat << 'EOF' > /etc/udev/rules.d/99-usb-kiosk.rules
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-kiosk-mount.service"
+EOF
 
-# Reload systemd and enable services
+# 5. Fix ownership and strict execution permissions
+echo "Setting precise file rules and execution permissions..."
+chown root:root /opt/kiosk/mount-usb.sh
+chmod 755 /opt/kiosk/mount-usb.sh
+
+chown root:root /etc/udev/rules.d/99-usb-kiosk.rules
+chmod 644 /etc/udev/rules.d/99-usb-kiosk.rules
+
+chown root:root /etc/systemd/system/usb-kiosk-mount.service
+chmod 644 /etc/systemd/system/usb-kiosk-mount.service
+
+# 6. Reload system layers to apply updates instantly
+echo "Reloading system configuration layers..."
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
-systemctl enable "$DISPLAY_SERVICE"
-systemctl enable devmon-automount
+udevadm control --reload-rules
+truncate -s 0 /var/log/usb-kiosk.log
 
 # Enable NetworkManager
 systemctl enable NetworkManager
