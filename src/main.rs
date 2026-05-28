@@ -20,10 +20,9 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use sysinfo::Disks;
-use tokio::join;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
@@ -32,6 +31,7 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 mod cmd;
 mod dashboard;
 mod html_generator;
+mod pptx_parser;
 use html_generator::generate_empty_folder_html;
 use html_generator::generate_html;
 use html_generator::generate_no_folder_html;
