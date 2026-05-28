@@ -13,7 +13,17 @@ impl PresentationFile {
         if let Some(ext) = self.name.split('.').last() {
             matches!(
                 ext.to_lowercase().as_str(),
-                "mp4" | "mov" | "avi" | "webm" | "ogg" | "mkv"
+                "mp4"
+                    | "m4v"
+                    | "m4p"
+                    | "mov"
+                    | "avi"
+                    | "webm"
+                    | "mkv"
+                    | "av1"
+                    | "3gp"
+                    | "mpg"
+                    | "mpeg"
             )
         } else {
             false
@@ -25,7 +35,21 @@ impl PresentationFile {
         if let Some(ext) = self.name.split('.').last() {
             matches!(
                 ext.to_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
+                "png"
+                    | "apng"
+                    | "jpg"
+                    | "jpeg"
+                    | "jfif"
+                    | "pjpeg"
+                    | "pjp"
+                    | "bmp"
+                    | "ico"
+                    | "cur"
+                    | "tif"
+                    | "tiff"
+                    | "gif"
+                    | "svg"
+                    | "webp"
             )
         } else {
             false
