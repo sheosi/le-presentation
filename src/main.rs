@@ -1,18 +1,18 @@
 use axum::{
-    extract::{Form, State, WebSocketUpgrade},
+    extract::{State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
-    response::Redirect,
     routing::{get, post},
     Router,
 };
+use html_generator::PresentationFile;
 use notify::Config as NotifyConfig;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use ordermap::OrderMap;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashSet},
     env,
     error::Error,
     fs,
@@ -35,7 +35,7 @@ mod pptx_parser;
 use html_generator::generate_empty_folder_html;
 use html_generator::generate_html;
 use html_generator::generate_no_folder_html;
-use html_generator::PresentationFile;
+use pptx_parser::PptxParser;
 
 #[cfg(not(feature = "embedded-device"))]
 use crate::cmd::open_link;
@@ -50,6 +50,7 @@ struct RunningConfInner {
     config: Config,
     presentation_version: String,
     reload_tx: broadcast::Sender<()>,
+    converting: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,6 +90,8 @@ async fn main() {
     // Load environment variables
     load_env();
 
+    load_easy_effects().await;
+
     // Get presentations directory
     // In embedded-device mode, default to /media/usb-kiosk for USB auto-mount
     #[cfg(feature = "embedded-device")]
@@ -125,6 +128,7 @@ async fn main() {
         config,
         presentation_version: String::new(),
         reload_tx: reload_tx.clone(),
+        converting: false,
     })));
 
     // Build our application with a route
@@ -132,8 +136,14 @@ async fn main() {
         .route("/", get(dashboard_handler))
         .route("/presentation", get(generate_html_endpoint))
         .route("/presentation/ws", get(websocket_handler))
-        .route("/settings/limiter", post(limiter_handler))
-        .route("/settings/volume", post(volume_handler))
+        .route(
+            "/settings/limiter",
+            post(dashboard::sys_integration::limiter_handler),
+        )
+        .route(
+            "/settings/volume",
+            post(dashboard::sys_integration::volume_handler),
+        )
         .layer(CorsLayer::permissive())
         .with_state(run_conf.clone())
         .fallback_service(ServeDir::new(&presentations_dir));
@@ -228,7 +238,7 @@ async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl Int
     }
 
     // Get presentation files from directory
-    match get_presentation_files(&presentations_dir) {
+    match get_presentation_files(&run_conf) {
         Ok(files) => {
             // Check if folder is empty (no valid media files)
             let has_valid_files = files.values().any(|f| f.is_image() || f.is_video());
@@ -310,8 +320,7 @@ async fn handle_socket(
 // Handler for dashboard
 async fn dashboard_handler(State(config): State<RunningConf>) -> impl IntoResponse {
     let limiter_on = config.0.lock().expect("").limiter_on;
-    let volume = get_current_volume();
-    let html = dashboard::main_dashboard(limiter_on, volume);
+    let html = dashboard::main_dashboard(limiter_on);
     ([("Content-Type", "text/html; charset=utf-8")], html).into_response()
 }
 
@@ -335,6 +344,7 @@ async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast:
     // Now set up the watcher
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     let tx_clone = tx.clone();
+    let run_conf_watcher = run_conf.clone();
 
     let mut watcher = RecommendedWatcher::new(
         move |res: Result<Event, notify::Error>| {
@@ -344,7 +354,15 @@ async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast:
                     notify::EventKind::Create(_)
                     | notify::EventKind::Remove(_)
                     | notify::EventKind::Modify(_) => {
-                        let _ = tx_clone.try_send(());
+                        // Skip events while converting to avoid reload loops
+                        let is_converting = run_conf_watcher
+                            .0
+                            .lock()
+                            .map(|conf| conf.converting)
+                            .unwrap_or(false);
+                        if !is_converting {
+                            let _ = tx_clone.try_send(());
+                        }
                     }
                     _ => {}
                 }
@@ -394,12 +412,21 @@ async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast:
                 });
 
                 if is_mounted != folder_accessible {
-                    if is_mounted {
-                        println!("Sysinfo detected mount at {}, broadcasting reload...", presentations_dir);
-                    } else {
-                        println!("Sysinfo detected unmount at {}, broadcasting reload...", presentations_dir);
+                    // Check if we're currently converting (avoid reload loops)
+                    let is_converting = run_conf
+                        .0
+                        .lock()
+                        .map(|conf| conf.converting)
+                        .unwrap_or(false);
+
+                    if !is_converting {
+                        if is_mounted {
+                            println!("Sysinfo detected mount at {}, broadcasting reload...", presentations_dir);
+                        } else {
+                            println!("Sysinfo detected unmount at {}, broadcasting reload...", presentations_dir);
+                        }
+                        let _ = run_conf.0.lock().expect("").reload_tx.send(());
                     }
-                    let _ = run_conf.0.lock().expect("").reload_tx.send(());
                     folder_accessible = is_mounted;
                 }
             }
@@ -412,18 +439,36 @@ async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast:
 
                 // Detect folder becoming accessible (created or mounted)
                 if accessible_now && !folder_accessible {
-                    println!("Presentations folder became accessible (mounted), broadcasting reload...");
-                    let _ = run_conf.0.lock().expect("").reload_tx.send(());
+                    // Check if we're currently converting (avoid reload loops)
+                    let is_converting = run_conf
+                        .0
+                        .lock()
+                        .map(|conf| conf.converting)
+                        .unwrap_or(false);
+
+                    if !is_converting {
+                        println!("Presentations folder became accessible (mounted), broadcasting reload...");
+                        let _ = run_conf.0.lock().expect("").reload_tx.send(());
+                    }
                     folder_accessible = true;
                     continue;
                 }
 
                 // Detect folder becoming inaccessible (deleted or unmounted)
                 if !accessible_now && folder_accessible {
-                    println!("Presentations folder became inaccessible (unmounted), broadcasting reload...");
-                    let _ = run_conf.0.lock().expect("").reload_tx.send(());
-                    let mut conf = run_conf.0.lock().expect("");
-                    conf.presentation_version = String::new();
+                    // Check if we're currently converting (avoid reload loops)
+                    let is_converting = run_conf
+                        .0
+                        .lock()
+                        .map(|conf| conf.converting)
+                        .unwrap_or(false);
+
+                    if !is_converting {
+                        println!("Presentations folder became inaccessible (unmounted), broadcasting reload...");
+                        let _ = run_conf.0.lock().expect("").reload_tx.send(());
+                        let mut conf = run_conf.0.lock().expect("");
+                        conf.presentation_version = String::new();
+                    }
                     folder_accessible = false;
                     continue;
                 }
@@ -435,7 +480,7 @@ async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast:
                 }
 
                 // Re-scan files and check if version changed
-                match get_presentation_files(&presentations_dir) {
+                match get_presentation_files(&run_conf) {
                     Ok(files) => {
                         let new_version = compute_version(&files);
                         let mut conf = run_conf.0.lock().expect("Failed to lock config");
@@ -547,15 +592,38 @@ async fn get_wifi_interface() -> Option<String> {
     None
 }
 
+struct GeneratorPresentationFile {
+    pub file: PresentationFile,
+    /// For use inside generators, keep track of the slide inside ppt, pptx and
+    /// pdfs for things like merging differente kinds of media
+    pub internal_slide: u32,
+}
+
+fn strip_generator_data(
+    input: OrderMap<String, GeneratorPresentationFile>,
+) -> OrderMap<String, PresentationFile> {
+    input.into_iter().map(|(s, f)| (s, f.file)).collect()
+}
+
 // Helper function to get presentation files for HTML generation
 fn get_presentation_files(
-    dir: &str,
+    run_conf: &RunningConf,
 ) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
+    // Get presentations_dir and set converting flag
+    let presentations_dir = {
+        let mut conf = run_conf.0.lock().expect("");
+        conf.converting = true;
+        conf.presentations_dir.clone()
+    };
+
     let mut files = OrderMap::new();
-    let path = Path::new(dir);
+    let path = Path::new(&presentations_dir);
 
     if !path.exists() {
-        return Err(format!("Directory '{}' not found", dir).into());
+        // Clear converting flag on error
+        let mut conf = run_conf.0.lock().expect("");
+        conf.converting = false;
+        return Err(format!("Directory '{}' not found", presentations_dir).into());
     }
 
     // Get entries and sort by filename
@@ -582,17 +650,59 @@ fn get_presentation_files(
         // Handle PDF conversion
         if f_lower.ends_with(".pdf") {
             let pdf_path = entry.path();
-            let converted_files = convert_pdf_to_images(&pdf_path)?;
+            let converted_files =
+                strip_generator_data(convert_pdf_to_images(&pdf_path, HashSet::new())?);
             files.extend(converted_files);
-        } else if f_lower.ends_with(".pptx") | f_lower.ends_with(".ppt") {
+        } else if f_lower.ends_with(".pptx") {
             let pptx_path = entry.path();
-            let converted_files = convert_pptx_to_svgs(&pptx_path)?;
+            let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
             files.extend(converted_files);
+        } else if f_lower.ends_with(".ppt") {
+            // For PPT files, convert to PPTX first, then extract videos and convert
+            let ppt_path = entry.path();
+            println!("Converting PPT to PPTX: {}", file_name);
+
+            // Convert PPT to PPTX using LibreOffice
+            let parent_dir = ppt_path.parent().unwrap_or(Path::new("."));
+            let pptx_path = ppt_path.with_extension("pptx");
+
+            let status = std::process::Command::new("flatpak")
+                .args([
+                    "run",
+                    "--filesystem=host",
+                    "org.libreoffice.LibreOffice",
+                    "--headless",
+                    "--convert-to",
+                    "pptx",
+                    "--outdir",
+                    parent_dir.to_str().unwrap(),
+                    ppt_path.to_str().unwrap(),
+                ])
+                .status();
+
+            match status {
+                Ok(s) if s.success() && pptx_path.exists() => {
+                    // Process the converted PPTX
+                    let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
+
+                    files.extend(converted_files);
+
+                    // Clean up the temporary PPTX file
+                    let _ = std::fs::remove_file(&pptx_path);
+                }
+                _ => {
+                    eprintln!("Failed to convert PPT to PPTX: {}", file_name);
+                }
+            }
         } else {
             // Add valid media file
             files.insert(file_name.clone(), PresentationFile { name: file_name });
         }
     }
+
+    // Clear converting flag before returning
+    let mut conf = run_conf.0.lock().expect("");
+    conf.converting = false;
 
     Ok(files)
 }
@@ -634,7 +744,16 @@ fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
 
 fn convert_pptx_to_svgs(
     pptx_path: &Path,
-) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
+) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
+    // First, extract any embedded videos from the PPTX
+    let videos = extract_videos_from_pptx(pptx_path).unwrap_or_else(|e| {
+        println!("Warning: Failed to extract videos from PPTX: {}", e);
+        ExtractedVideos {
+            extracted_videos: OrderMap::new(),
+            slides_with_videos: HashSet::new(),
+        }
+    });
+
     if !pptx_path
         .with_file_name(format!(
             "{}_1.svg",
@@ -643,18 +762,37 @@ fn convert_pptx_to_svgs(
         .exists()
     {
         let pdf_path = convert_pptx_to_pdf(pptx_path)?;
-        let result = convert_pdf_to_images(&pdf_path)?;
+        let svg_result = convert_pdf_to_images(&pdf_path, videos.slides_with_videos)?;
         let _ = fs::remove_file(&pdf_path);
+
+        // Filter out SVGs for slides that have videos (keep only videos)
+        let mut result = OrderMap::new();
+
+        // Add extracted videos to result (already PresentationFile objects)
+        for (video_name, presentation_file) in videos.extracted_videos.into_iter() {
+            result.insert(video_name.clone(), presentation_file);
+        }
+
+        // Add SVGs only for slides that DON'T have videos
+        for (svg_name, presentation_file) in svg_result {
+            result.insert(svg_name, presentation_file);
+        }
+
+        let result = result
+            .sorted_by(|_, f1, _, f2| f1.internal_slide.cmp(&f2.internal_slide))
+            .collect();
+
         Ok(result)
     } else {
-        // If they already exist will be picked as part of the FS pass
-        Ok(OrderMap::new())
+        // SVGs already exist - just return the videos (already PresentationFile objects)
+        Ok(videos.extracted_videos)
     }
 }
 
 fn convert_pdf_to_images(
     pdf_path: &Path,
-) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
+    skip: HashSet<u32>,
+) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
     if pdf_path
         .with_file_name(format!(
             "{}_1.svg",
@@ -670,6 +808,10 @@ fn convert_pdf_to_images(
 
     let mut result = OrderMap::new();
     for i in 1..=page_count {
+        if skip.contains(&i) {
+            continue;
+        }
+
         let output_svg = format!(
             "{}_{}.svg",
             pdf_path.file_stem().expect("").to_str().expect(""),
@@ -684,7 +826,13 @@ fn convert_pdf_to_images(
 
         if svg_status.success() {
             println!("Generated: {}", output_svg);
-            result.insert(output_svg.clone(), PresentationFile { name: output_svg });
+            result.insert(
+                output_svg.clone(),
+                GeneratorPresentationFile {
+                    file: PresentationFile { name: output_svg },
+                    internal_slide: i,
+                },
+            );
         }
     }
 
@@ -730,122 +878,227 @@ fn is_media_file(filename: &str) -> bool {
     )
 }
 
-/// Get current volume percentage using wpctl (PipeWire/WirePlumber) or pactl (PulseAudio/PipeWire compat)
-/// Returns None if no volume control tool is available
-fn get_current_volume() -> Option<u8> {
-    // Try wpctl first (PipeWire native)
-    if app("wpctl").is_some() {
-        if let Some(mut cmd) = app("wpctl") {
-            cmd.args(["get-volume", "@DEFAULT_AUDIO_SINK@"]);
-            if let Ok(output) = cmd.output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // Parse "Volume: 0.75" format
-                if let Some(vol) = stdout
-                    .lines()
-                    .find(|l| l.contains("Volume:"))
-                    .and_then(|l| {
-                        l.split_whitespace()
-                            .last()
-                            .and_then(|v| v.parse::<f32>().ok())
-                    })
-                    .map(|v| (v * 100.0) as u8)
-                {
-                    return Some(vol);
-                }
-            }
-        }
-    }
+struct ExtractedVideos {
+    extracted_videos: OrderMap<String, GeneratorPresentationFile>,
+    slides_with_videos: HashSet<u32>,
+}
 
-    // Fallback to pactl (PulseAudio/PipeWire compatibility)
-    if app("pactl").is_some() {
-        if let Some(mut cmd) = app("pactl") {
-            cmd.args(["list", "sinks"]);
-            if let Ok(output) = cmd.output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // Find the default sink and extract volume percentage
-                for line in stdout.lines() {
-                    if line.contains("Volume:") && line.contains('%') {
-                        // Parse "Volume: front-left: 65536 / 100% / 0.00 dB,..."
-                        if let Some(percent_start) = line.find('/') {
-                            let after_slash = &line[percent_start + 1..];
-                            if let Some(percent_end) = after_slash.find('%') {
-                                if let Ok(vol) = after_slash[..percent_end].trim().parse::<u8>() {
-                                    return Some(vol);
-                                }
+/// Extract embedded videos from a PPTX file and save them to the presentations directory
+/// Returns a map of video file names to PresentationFile (already sorted by slide number)
+fn extract_videos_from_pptx(
+    pptx_path: &Path,
+) -> Result<ExtractedVideos, Box<dyn std::error::Error>> {
+    let mut extracted_videos: OrderMap<u32, Vec<String>> = OrderMap::new();
+
+    // Parse the PPTX to find embedded media
+    let pptx_info = PptxParser::parse(pptx_path)?;
+
+    // Get the base name for video naming
+    let base_name = pptx_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or("presentation");
+
+    // Open the PPTX as a ZIP to extract media files
+    let file = std::fs::File::open(pptx_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    // Track video index per slide for naming
+    let mut slide_video_counts: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+
+    // Process each slide's embedded media
+    for slide in &pptx_info.slides {
+        let slide_number = slide.slide_number;
+
+        // Track already-extracted media to avoid duplicates (key: source media path)
+        let mut extracted_media: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for media in &slide.embedded_media {
+            // Only process video files
+            if !matches!(media.media_type, pptx_parser::MediaType::Video) {
+                continue;
+            }
+
+            // Count videos for this slide
+            let video_count = slide_video_counts.entry(slide_number).or_insert(0);
+            *video_count += 1;
+
+            // Skip if we've already extracted this media
+            if !extracted_media.insert(media.filename.clone()) {
+                continue;
+            }
+
+            // Check if this is an external file reference (file://)
+            if media.filename.starts_with("file://") {
+                // Parse the external file path
+                let source_path = &media.filename[7..]; // Strip "file://" prefix
+                let source = Path::new(source_path);
+
+                if source.exists() {
+                    // Get the file extension
+                    let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+
+                    // Create output filename: {base_name}_video_{slide_number}_{video_count}.{ext}
+                    let output_name = format!(
+                        "{}-{}_video_{}.{}",
+                        base_name, slide_number, video_count, ext
+                    );
+                    let output_path = pptx_path.with_file_name(&output_name);
+
+                    // Ignore a file that already is there
+                    if !output_path.exists() {
+                        // Copy the external file to presentations directory
+                        match std::fs::copy(source, &output_path) {
+                            Ok(_) => {
+                                extracted_videos
+                                    .entry(slide_number)
+                                    .or_default()
+                                    .push(output_name);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to copy external video from slide {}: {} - {}",
+                                    slide_number,
+                                    source.display(),
+                                    e
+                                );
                             }
                         }
+                    } else {
+                        extracted_videos
+                            .entry(slide_number)
+                            .or_default()
+                            .push(output_name);
                     }
+                } else {
+                    eprintln!(
+                        "External video not found on slide {}: {}",
+                        slide_number,
+                        source.display()
+                    );
                 }
+                continue;
+            }
+
+            // Handle embedded media (inside PPTX ZIP)
+            // Media paths in relationships are like "../media/video1.mp4"
+            // We need to convert to the path inside the ZIP: "ppt/media/video1.mp4"
+            let media_path_in_zip = if media.filename.contains("/") {
+                // Try to extract just the filename
+                Path::new(&media.filename)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| format!("ppt/media/{}", n))
+            } else {
+                Some(format!("ppt/media/{}", media.filename))
+            };
+
+            let media_path_in_zip = match media_path_in_zip {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Try to find and extract the file from the ZIP
+            if let Ok(mut media_file) = archive.by_name(&media_path_in_zip) {
+                // Get the file extension
+                let ext = Path::new(&media_path_in_zip)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("mp4");
+
+                // Create output filename: {base_name}_video_{slide_number}_{video_count}.{ext}
+                let output_name = format!(
+                    "{}-{}__video_{}.{}",
+                    base_name, slide_number, video_count, ext
+                );
+                let output_path = pptx_path.with_file_name(&output_name);
+
+                // Extract the file
+                let mut output_file = std::fs::File::create(&output_path)?;
+                std::io::copy(&mut media_file, &mut output_file)?;
+
+                println!(
+                    "Extracted embedded video from slide {}: {}",
+                    slide_number, output_name
+                );
+
+                // Map this slide to the extracted video
+                extracted_videos
+                    .entry(slide_number)
+                    .or_default()
+                    .push(output_name);
+            } else {
+                // Media referenced but not found in ZIP
+                println!(
+                    "Warning: Video referenced on slide {} but not found in PPTX: {}",
+                    slide_number, media_path_in_zip
+                );
             }
         }
     }
 
-    None // No volume control available
-}
-
-/// Set volume up or down by 5%
-fn change_volume(direction: &str) {
-    let (wpctl_change, pactl_change) = match direction {
-        "up" => ("5%+", "+5%"),
-        "down" => ("5%-", "-5%"),
-        _ => return,
-    };
-
-    // Try wpctl first (PipeWire native)
-    if let Some(mut cmd) = app("wpctl") {
-        cmd.args(["set-volume", "@DEFAULT_AUDIO_SINK@", wpctl_change]);
-        if cmd.status().map(|s| s.success()).unwrap_or(false) {
-            return;
+    // Convert to OrderMap<String, PresentationFile> with proper ordering
+    // The OrderMap is already sorted by slide_number (u32), and within each slide,
+    // videos are in extraction order (video_count order)
+    let mut result = OrderMap::new();
+    let mut slides_with_videos = HashSet::new();
+    for (slide_number, video_names) in extracted_videos {
+        for video_name in video_names {
+            result.insert(
+                video_name.clone(),
+                GeneratorPresentationFile {
+                    file: PresentationFile { name: video_name },
+                    internal_slide: slide_number,
+                },
+            );
         }
+        slides_with_videos.insert(slide_number);
     }
 
-    // Fallback to pactl (PulseAudio/PipeWire compatibility)
-    if let Some(mut cmd) = app("pactl") {
-        cmd.args(["set-sink-volume", "@DEFAULT_SINK@", pactl_change]);
-        let _ = cmd.status();
+    Ok(ExtractedVideos {
+        extracted_videos: result,
+        slides_with_videos,
+    })
+}
+
+/// Extract embedded videos from a PPT file by first converting to PPTX
+fn extract_videos_from_ppt(ppt_path: &Path) -> Result<ExtractedVideos, Box<dyn std::error::Error>> {
+    // Convert PPT to PPTX using LibreOffice
+    let pptx_path = ppt_path.with_extension("pptx");
+
+    // Run LibreOffice conversion via Flatpak
+    let status = std::process::Command::new("flatpak")
+        .args([
+            "run",
+            "--filesystem=host",
+            "org.libreoffice.LibreOffice",
+            "--headless",
+            "--convert-to",
+            "pptx",
+            "--outdir",
+            ppt_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_str()
+                .unwrap(),
+            ppt_path.to_str().unwrap(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err("Failed to convert PPT to PPTX".into());
     }
-}
 
-#[derive(Deserialize)]
-struct LimiterQuery {
-    enable: Option<String>,
-}
+    // Extract videos from the converted PPTX
+    let result = extract_videos_from_pptx(&pptx_path);
 
-async fn limiter_handler(
-    State(config): State<RunningConf>,
-    Form(query): Form<LimiterQuery>,
-) -> impl IntoResponse {
-    if query.enable.as_deref() == Some("on") {
-        config.0.lock().expect("").limiter_on = true;
-        try_run(cmd::app("flatpak").map(|mut a| {
-            a.args(["run", "com.github.wwmm.easyeffects", "-b", "2"]);
-            a
-        }));
-    } else {
-        config.0.lock().expect("").limiter_on = false;
-        try_run(cmd::app("flatpak").map(|mut a| {
-            a.args(["run", "com.github.wwmm.easyeffects", "-b", "1"]);
-            a
-        }));
-    }
-    Redirect::to("/")
-}
+    // Clean up the temporary PPTX file
+    let _ = std::fs::remove_file(&pptx_path);
 
-#[derive(Deserialize)]
-struct VolumeQuery {
-    direction: String,
-}
-
-async fn volume_handler(Form(query): Form<VolumeQuery>) -> impl IntoResponse {
-    // Only change volume if control is available
-    if volume_control_available() {
-        match query.direction.as_str() {
-            "up" => change_volume("up"),
-            "down" => change_volume("down"),
-            _ => {}
-        }
-    }
-    Redirect::to("/")
+    result
 }
 
 // Helper function to create presentations directory

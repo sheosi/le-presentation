@@ -1,4 +1,7 @@
-pub fn main_dashboard(limiter_on: bool, volume: Option<u8>) -> String {
+pub mod sys_integration;
+
+pub fn main_dashboard(limiter_on: bool) -> String {
+    let volume = sys_integration::get_current_volume();
     format!(
         r#"<!DOCTYPE html>
         <html lang="es">
