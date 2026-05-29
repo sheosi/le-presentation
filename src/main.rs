@@ -650,6 +650,8 @@ fn get_presentation_files(
 
         let f_lower = file_name.to_lowercase();
 
+        // TODO: Extract animations
+
         // Handle PDF conversion
         if f_lower.ends_with(".pdf") {
             let pdf_path = entry.path();
@@ -672,43 +674,55 @@ fn get_presentation_files(
             let parent_dir = ppt_path.parent().unwrap_or(Path::new("."));
             let pptx_path = ppt_path.with_extension("pptx");
 
-            let status = std::process::Command::new("flatpak")
-                .args([
-                    "run",
-                    "--filesystem=host",
-                    "org.libreoffice.LibreOffice",
-                    "--headless",
-                    "--convert-to",
-                    "pptx",
-                    "--outdir",
-                    parent_dir.to_str().unwrap(),
-                    ppt_path.to_str().unwrap(),
-                ])
-                .status();
+            if !pptx_path.exists() {
+                let status = std::process::Command::new("flatpak")
+                    .args([
+                        "run",
+                        "--filesystem=host",
+                        "org.libreoffice.LibreOffice",
+                        "--headless",
+                        "--convert-to",
+                        "pptx",
+                        "--outdir",
+                        parent_dir.to_str().unwrap(),
+                        ppt_path.to_str().unwrap(),
+                    ])
+                    .status();
 
-            match status {
-                Ok(s) if s.success() && pptx_path.exists() => {
-                    // Process the converted PPTX
-                    let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
+                match status {
+                    Ok(s) if s.success() && pptx_path.exists() => {
+                        // Process the converted PPTX
+                        let converted_files =
+                            strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
 
-                    files.extend(converted_files);
+                        files.extend(converted_files);
 
-                    // Clean up the temporary PPTX file
-                    let _ = std::fs::remove_file(&pptx_path);
+                        // Clean up the temporary PPTX file
+                        let _ = std::fs::remove_file(&pptx_path);
+                    }
+                    _ => {
+                        eprintln!("Failed to convert PPT to PPTX: {}", file_name);
+                    }
                 }
-                _ => {
-                    eprintln!("Failed to convert PPT to PPTX: {}", file_name);
-                }
+            } else {
+                let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
+
+                files.extend(converted_files);
+
+                // Clean up the temporary PPTX file
+                let _ = std::fs::remove_file(&pptx_path);
             }
         } else {
             // Add valid media file
-            files.insert(
-                file_name.clone(),
-                PresentationFile {
-                    name: file_name,
-                    transition: RevealTransition::default(),
-                },
-            );
+            if !files.contains_key(&file_name) {
+                files.insert(
+                    file_name.clone(),
+                    PresentationFile {
+                        name: file_name,
+                        transition: RevealTransition::default(),
+                    },
+                );
+            }
         }
     }
 
@@ -758,16 +772,17 @@ fn convert_pptx_to_svgs(
     pptx_path: &Path,
 ) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
     // First, extract any embedded videos from the PPTX
-    let parse_result = extract_videos_from_pptx(pptx_path).unwrap_or_else(|e| {
+    let mut parse_result = extract_videos_from_pptx(pptx_path).unwrap_or_else(|e| {
         println!("Warning: Failed to extract videos from PPTX: {}", e);
         ExtractedVideos {
             extracted_videos: OrderMap::new(),
             slides_with_videos: HashSet::new(),
             slides_with_transitions: HashMap::new(),
+            slides_count: 0,
         }
     });
 
-    if !pptx_path
+    let mut result = if !pptx_path
         .with_file_name(format!(
             "{}_1.svg",
             pptx_path.file_stem().expect("").to_str().expect("")
@@ -785,25 +800,55 @@ fn convert_pptx_to_svgs(
         // Filter out SVGs for slides that have videos (keep only videos)
         let mut result = OrderMap::new();
 
-        // Add extracted videos to result (already PresentationFile objects)
-        for (video_name, presentation_file) in parse_result.extracted_videos.into_iter() {
-            result.insert(video_name.clone(), presentation_file);
-        }
-
-        // Add SVGs only for slides that DON'T have videos
         for (svg_name, presentation_file) in svg_result {
             result.insert(svg_name, presentation_file);
         }
 
-        let result = result
-            .sorted_by(|_, f1, _, f2| f1.internal_slide.cmp(&f2.internal_slide))
+        result
+    } else {
+        let res = (1..=parse_result.slides_count)
+            .filter_map(|i| {
+                if parse_result.slides_with_videos.contains(&i) {
+                    return None;
+                }
+
+                let transition = parse_result
+                    .slides_with_transitions
+                    .remove(&i)
+                    .unwrap_or_else(RevealTransition::default);
+
+                let output_svg = format!(
+                    "{}_{}.svg",
+                    pptx_path.file_stem().expect("").to_str().expect(""),
+                    i
+                );
+
+                Some((
+                    output_svg.clone(),
+                    GeneratorPresentationFile {
+                        file: PresentationFile {
+                            name: output_svg,
+                            transition,
+                        },
+                        internal_slide: i,
+                    },
+                ))
+            })
             .collect();
 
-        Ok(result)
-    } else {
-        // SVGs already exist - just return the videos (already PresentationFile objects)
-        Ok(parse_result.extracted_videos)
+        res
+    };
+
+    // Add extracted videos to result (already PresentationFile objects)
+    for (video_name, presentation_file) in parse_result.extracted_videos.into_iter() {
+        result.insert(video_name.clone(), presentation_file);
     }
+
+    let result = result
+        .sorted_by(|_, f1, _, f2| f1.internal_slide.cmp(&f2.internal_slide))
+        .collect();
+
+    Ok(result)
 }
 
 fn convert_pdf_to_images(
@@ -908,6 +953,7 @@ struct ExtractedVideos {
     extracted_videos: OrderMap<String, GeneratorPresentationFile>,
     slides_with_videos: HashSet<u32>,
     slides_with_transitions: HashMap<u32, RevealTransition>,
+    slides_count: u32,
 }
 
 /// Extract embedded videos from a PPTX file and save them to the presentations directory
@@ -1167,6 +1213,7 @@ fn extract_videos_from_pptx(
         extracted_videos: result,
         slides_with_videos,
         slides_with_transitions: slide_transitions,
+        slides_count: pptx_info.slide_count,
     })
 }
 
