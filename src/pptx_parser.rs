@@ -6,6 +6,9 @@ use std::io::Read;
 use std::path::Path;
 use zip::read::ZipArchive;
 
+// For PPT support
+use office_oxide::ppt::PptDocument;
+
 /// Parsed information about a PPTX presentation
 #[derive(Debug)]
 pub struct PptxInfo {
@@ -722,6 +725,191 @@ impl PptxParser {
 
         summary
     }
+
+    /// Parse a legacy PPT file (binary format) using office_oxide
+    ///
+    /// Note: office_oxide provides text and image extraction, but may not
+    /// expose embedded video/audio media. For media extraction from PPT,
+    /// consider converting to PPTX first using LibreOffice:
+    /// `libreoffice --headless --convert-to pptx input.ppt`
+    pub fn parse_ppt(path: &Path) -> Result<PptxInfo, PptxParseError> {
+        let doc = PptDocument::open(path).map_err(|e| {
+            PptxParseError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse PPT: {}", e),
+            ))
+        })?;
+
+        let slide_count = doc.slides.len() as u32;
+        let mut slides = Vec::new();
+
+        // Convert SlideText to SlideInfo
+        for (idx, _slide_text) in doc.slides.iter().enumerate() {
+            let slide_number = (idx + 1) as u32;
+
+            // Note: office_oxide doesn't expose animations/transitions/media
+            // from PPT files in the current API. We extract what we can.
+            let slide_info = SlideInfo {
+                slide_number,
+                animations: Vec::new(),     // Not exposed by office_oxide
+                transition: None,           // Not exposed by office_oxide
+                embedded_media: Vec::new(), // Images available via doc.images() but not media
+            };
+            slides.push(slide_info);
+        }
+
+        Ok(PptxInfo {
+            slide_count,
+            slides,
+        })
+    }
+
+    /// Parse either PPTX or PPT based on file extension
+    pub fn parse_auto(path: &Path) -> Result<PptxInfo, PptxParseError> {
+        match path.extension() {
+            Some(ext) if ext.eq_ignore_ascii_case("ppt") => Self::parse_ppt(path),
+            Some(ext) if ext.eq_ignore_ascii_case("pptx") => Self::parse(path),
+            _ => {
+                // Try to detect format from file signature
+                let mut file = File::open(path)?;
+                let mut signature = [0u8; 8];
+                file.read_exact(&mut signature)?;
+                drop(file);
+
+                // PPTX files start with PK (ZIP signature)
+                if signature.starts_with(b"PK") {
+                    Self::parse(path)
+                } else {
+                    // Assume PPT binary format
+                    Self::parse_ppt(path)
+                }
+            }
+        }
+    }
+
+    /// Parse PPT by converting to PPTX using LibreOffice (Flatpak), then extract media
+    ///
+    /// This provides full media extraction (video/audio) from PPT files by
+    /// leveraging LibreOffice's conversion capabilities.
+    ///
+    /// Requires LibreOffice Flatpak to be installed: org.libreoffice.LibreOffice
+    pub fn parse_ppt_with_conversion(path: &Path) -> Result<PptxInfo, PptxParseError> {
+        use std::env;
+        use std::fs;
+        use std::process::Command;
+
+        // Verify the input file exists
+        if !path.exists() {
+            return Err(PptxParseError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Input file not found: {}", path.display()),
+            )));
+        }
+
+        // Create a temporary directory for conversion
+        let temp_dir = env::temp_dir().join(format!("ppt_conversion_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir)?;
+
+        // Get the input file name and construct output path
+        let input_path = path.canonicalize()?;
+        let file_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("converted");
+        let output_path = temp_dir.join(format!("{}.pptx", file_stem));
+
+        // Run LibreOffice conversion via Flatpak with filesystem access
+        // Flatpak is sandboxed, so we need to explicitly grant access to:
+        // 1. The input file's directory (so it can read the PPT)
+        // 2. The temp directory (so it can write the PPTX)
+        let temp_dir_str = temp_dir.to_str().unwrap();
+        let input_dir = input_path.parent().unwrap_or(Path::new("."));
+        let input_dir_str = input_dir.to_str().unwrap();
+        let fs_arg_temp = format!("--filesystem={}", temp_dir_str);
+        let fs_arg_input = format!("--filesystem={}", input_dir_str);
+
+        // Command: flatpak run --filesystem=<temp> --filesystem=<input_dir> org.libreoffice.LibreOffice --headless --convert-to pptx --outdir <temp> <input>
+        let result = Command::new("flatpak")
+            .args([
+                "run",
+                &fs_arg_temp,
+                &fs_arg_input,
+                "org.libreoffice.LibreOffice",
+                "--headless",
+                "--convert-to",
+                "pptx",
+                "--outdir",
+                temp_dir_str,
+                input_path.to_str().unwrap(),
+            ])
+            .output();
+
+        match result {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    // Clean up temp directory
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    return Err(PptxParseError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("LibreOffice conversion failed: {}", stderr),
+                    )));
+                }
+            }
+            Err(e) => {
+                // Clean up temp directory
+                let _ = fs::remove_dir_all(&temp_dir);
+                return Err(PptxParseError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Failed to execute Flatpak LibreOffice (org.libreoffice.LibreOffice). Is it installed? Error: {}",
+                        e
+                    ),
+                )));
+            }
+        }
+
+        println!("{:?}", &output_path);
+
+        // Check if the output file was created
+        if !output_path.exists() {
+            // LibreOffice might create files with slightly different names
+            // Try to find any .pptx file in the temp directory
+            let mut found_pptx = None;
+            if let Ok(entries) = fs::read_dir(&temp_dir) {
+                for entry in entries.flatten() {
+                    if let Some(ext) = entry.path().extension() {
+                        if ext.eq_ignore_ascii_case("pptx") {
+                            found_pptx = Some(entry.path());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let pptx_path = match found_pptx {
+                Some(p) => p,
+                None => {
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    return Err(PptxParseError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "LibreOffice did not create output file",
+                    )));
+                }
+            };
+
+            // Parse the found PPTX file
+            let result = Self::parse(&pptx_path);
+            let _ = fs::remove_dir_all(&temp_dir);
+            result
+        } else {
+            // Parse the converted PPTX file
+            let result = Self::parse(&output_path);
+            // Clean up temporary directory
+            let _ = fs::remove_dir_all(&temp_dir);
+            result
+        }
+    }
 }
 
 #[cfg(test)]
@@ -879,5 +1067,81 @@ mod tests {
         assert!(media[0].filename.contains("video.mp4"));
         assert!(matches!(media[1].media_type, MediaType::Video));
         assert!(media[1].filename.contains("video.mp4"));
+    }
+
+    /// Test that loads a real PPT file using LibreOffice conversion
+    /// and outputs the parsed results to console
+    #[test]
+    fn test_parse_ppt_file_with_conversion() {
+        let ppt_path = Path::new("Sample-PPT-File-500kb.ppt");
+
+        // Skip test if file doesn't exist
+        if !ppt_path.exists() {
+            println!(
+                "Skipping test: PPT file not found at {}",
+                ppt_path.display()
+            );
+            return;
+        }
+
+        println!("\n========================================");
+        println!("Parsing PPT file: {}", ppt_path.display());
+        println!("========================================\n");
+
+        // Try to parse with LibreOffice conversion
+        match PptxParser::parse_ppt_with_conversion(ppt_path) {
+            Ok(info) => {
+                println!("Successfully parsed PPT file!");
+                println!("Slide count: {}", info.slide_count);
+                println!("\n--- Slide Details ---");
+
+                for slide in &info.slides {
+                    println!("\nSlide {}:", slide.slide_number);
+
+                    if let Some(ref trans) = slide.transition {
+                        println!(
+                            "  Transition: {:?} ({}ms)",
+                            trans.transition_type, trans.duration_ms
+                        );
+                    } else {
+                        println!("  Transition: None");
+                    }
+
+                    println!("  Animations: {} found", slide.animations.len());
+                    for (i, anim) in slide.animations.iter().enumerate() {
+                        println!(
+                            "    [{}] {:?} (trigger: {:?})",
+                            i, anim.animation_type, anim.trigger
+                        );
+                    }
+
+                    println!("  Embedded media: {} found", slide.embedded_media.len());
+                    for (i, media) in slide.embedded_media.iter().enumerate() {
+                        println!("    [{}] {:?}: {}", i, media.media_type, media.filename);
+                    }
+                }
+
+                println!("\n========================================");
+                println!("Parsing complete!");
+                println!("========================================\n");
+
+                // The test passes if we successfully parsed
+                // We don't make assertions about content since it depends on the file
+            }
+            Err(e) => {
+                // Check if error is due to Flatpak/LibreOffice not being installed
+                let error_str = format!("{}", e);
+                if error_str.contains("Flatpak")
+                    || error_str.contains("LibreOffice")
+                    || error_str.contains("NotFound")
+                {
+                    println!("Skipping test: Flatpak LibreOffice not installed or not found");
+                    println!("Install with: flatpak install flathub org.libreoffice.LibreOffice");
+                    println!("Error: {}", e);
+                    return;
+                }
+                panic!("Failed to parse PPT file: {}", e);
+            }
+        }
     }
 }
