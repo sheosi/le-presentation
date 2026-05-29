@@ -12,7 +12,7 @@ use ordermap::OrderMap;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env,
     error::Error,
     fs,
@@ -39,7 +39,10 @@ use pptx_parser::PptxParser;
 
 #[cfg(not(feature = "embedded-device"))]
 use crate::cmd::open_link;
-use crate::cmd::{app, try_run};
+use crate::{
+    cmd::{app, try_run},
+    html_generator::{RevealTransition, RevealTransitionKind, RevealTransitionSpeed},
+};
 
 #[derive(Clone)]
 struct RunningConf(Arc<Mutex<RunningConfInner>>);
@@ -650,8 +653,11 @@ fn get_presentation_files(
         // Handle PDF conversion
         if f_lower.ends_with(".pdf") {
             let pdf_path = entry.path();
-            let converted_files =
-                strip_generator_data(convert_pdf_to_images(&pdf_path, HashSet::new())?);
+            let converted_files = strip_generator_data(convert_pdf_to_images(
+                &pdf_path,
+                HashSet::new(),
+                HashMap::new(),
+            )?);
             files.extend(converted_files);
         } else if f_lower.ends_with(".pptx") {
             let pptx_path = entry.path();
@@ -696,7 +702,13 @@ fn get_presentation_files(
             }
         } else {
             // Add valid media file
-            files.insert(file_name.clone(), PresentationFile { name: file_name });
+            files.insert(
+                file_name.clone(),
+                PresentationFile {
+                    name: file_name,
+                    transition: RevealTransition::default(),
+                },
+            );
         }
     }
 
@@ -746,11 +758,12 @@ fn convert_pptx_to_svgs(
     pptx_path: &Path,
 ) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
     // First, extract any embedded videos from the PPTX
-    let videos = extract_videos_from_pptx(pptx_path).unwrap_or_else(|e| {
+    let parse_result = extract_videos_from_pptx(pptx_path).unwrap_or_else(|e| {
         println!("Warning: Failed to extract videos from PPTX: {}", e);
         ExtractedVideos {
             extracted_videos: OrderMap::new(),
             slides_with_videos: HashSet::new(),
+            slides_with_transitions: HashMap::new(),
         }
     });
 
@@ -762,14 +775,18 @@ fn convert_pptx_to_svgs(
         .exists()
     {
         let pdf_path = convert_pptx_to_pdf(pptx_path)?;
-        let svg_result = convert_pdf_to_images(&pdf_path, videos.slides_with_videos)?;
+        let svg_result = convert_pdf_to_images(
+            &pdf_path,
+            parse_result.slides_with_videos,
+            parse_result.slides_with_transitions,
+        )?;
         let _ = fs::remove_file(&pdf_path);
 
         // Filter out SVGs for slides that have videos (keep only videos)
         let mut result = OrderMap::new();
 
         // Add extracted videos to result (already PresentationFile objects)
-        for (video_name, presentation_file) in videos.extracted_videos.into_iter() {
+        for (video_name, presentation_file) in parse_result.extracted_videos.into_iter() {
             result.insert(video_name.clone(), presentation_file);
         }
 
@@ -785,13 +802,14 @@ fn convert_pptx_to_svgs(
         Ok(result)
     } else {
         // SVGs already exist - just return the videos (already PresentationFile objects)
-        Ok(videos.extracted_videos)
+        Ok(parse_result.extracted_videos)
     }
 }
 
 fn convert_pdf_to_images(
     pdf_path: &Path,
     skip: HashSet<u32>,
+    mut transitions: HashMap<u32, RevealTransition>,
 ) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
     if pdf_path
         .with_file_name(format!(
@@ -826,10 +844,18 @@ fn convert_pdf_to_images(
 
         if svg_status.success() {
             println!("Generated: {}", output_svg);
+
+            let transition = transitions
+                .remove(&i)
+                .unwrap_or_else(RevealTransition::default);
+
             result.insert(
                 output_svg.clone(),
                 GeneratorPresentationFile {
-                    file: PresentationFile { name: output_svg },
+                    file: PresentationFile {
+                        name: output_svg,
+                        transition,
+                    },
                     internal_slide: i,
                 },
             );
@@ -881,6 +907,7 @@ fn is_media_file(filename: &str) -> bool {
 struct ExtractedVideos {
     extracted_videos: OrderMap<String, GeneratorPresentationFile>,
     slides_with_videos: HashSet<u32>,
+    slides_with_transitions: HashMap<u32, RevealTransition>,
 }
 
 /// Extract embedded videos from a PPTX file and save them to the presentations directory
@@ -907,6 +934,8 @@ fn extract_videos_from_pptx(
     // Track video index per slide for naming
     let mut slide_video_counts: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
+
+    let mut slide_transitions = HashMap::new();
 
     // Process each slide's embedded media
     for slide in &pptx_info.slides {
@@ -1037,6 +1066,75 @@ fn extract_videos_from_pptx(
                     slide_number, media_path_in_zip
                 );
             }
+
+            let transition = if let Some(ref transition) = slide.transition {
+                let tr_kind = match transition.transition_type {
+                    pptx_parser::TransitionType::None => RevealTransitionKind::None,
+                    pptx_parser::TransitionType::Fade => RevealTransitionKind::Fade,
+                    pptx_parser::TransitionType::Cut => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::RandomBars => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Newsflash => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Vortex => RevealTransitionKind::Concave,
+                    pptx_parser::TransitionType::Shred => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Switch => RevealTransitionKind::Convex,
+                    pptx_parser::TransitionType::Flip => RevealTransitionKind::Convex,
+                    pptx_parser::TransitionType::Gallery => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Ripple => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Honeycomb => RevealTransitionKind::Fade,
+                    pptx_parser::TransitionType::Cube => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Box => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Accordion => RevealTransitionKind::Concave,
+                    pptx_parser::TransitionType::Frame => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Glitter => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Airplane => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::FerrisWheel => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::ConveyorBelt => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Clock => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Wheel => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Comb => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Morph => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::ZoomCenter => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Rotate => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Push(_) => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Cover(_) => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Uncover(_) => RevealTransitionKind::Fade,
+                    pptx_parser::TransitionType::PeelOff(_) => RevealTransitionKind::Convex,
+                    pptx_parser::TransitionType::PageCurl(_) => RevealTransitionKind::Concave,
+                    pptx_parser::TransitionType::Wipe(_) => RevealTransitionKind::Fade,
+                    pptx_parser::TransitionType::Split(_) => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Reveal(_) => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Doors(_) => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Window(_) => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Pan(_) => RevealTransitionKind::Slide,
+                    pptx_parser::TransitionType::Zoom(_) => RevealTransitionKind::Zoom,
+                    pptx_parser::TransitionType::Other(_) => RevealTransitionKind::default(),
+                };
+
+                match transition.duration_ms {
+                    0 => RevealTransition {
+                        kind: RevealTransitionKind::None,
+                        speed: RevealTransitionSpeed::Default,
+                    },
+                    1..=300 => RevealTransition {
+                        kind: tr_kind,
+                        speed: RevealTransitionSpeed::Fast,
+                    },
+                    301..=500 => RevealTransition {
+                        kind: tr_kind,
+                        speed: RevealTransitionSpeed::Default,
+                    },
+                    _ => RevealTransition {
+                        kind: tr_kind,
+                        speed: RevealTransitionSpeed::Slow,
+                    },
+                }
+            } else {
+                RevealTransition::default()
+            };
+
+            if !transition.is_default() {
+                slide_transitions.insert(slide_number, transition);
+            }
         }
     }
 
@@ -1047,10 +1145,17 @@ fn extract_videos_from_pptx(
     let mut slides_with_videos = HashSet::new();
     for (slide_number, video_names) in extracted_videos {
         for video_name in video_names {
+            let transition = slide_transitions
+                .remove(&slide_number)
+                .unwrap_or_else(RevealTransition::default);
+
             result.insert(
                 video_name.clone(),
                 GeneratorPresentationFile {
-                    file: PresentationFile { name: video_name },
+                    file: PresentationFile {
+                        name: video_name,
+                        transition,
+                    },
                     internal_slide: slide_number,
                 },
             );
@@ -1061,44 +1166,8 @@ fn extract_videos_from_pptx(
     Ok(ExtractedVideos {
         extracted_videos: result,
         slides_with_videos,
+        slides_with_transitions: slide_transitions,
     })
-}
-
-/// Extract embedded videos from a PPT file by first converting to PPTX
-fn extract_videos_from_ppt(ppt_path: &Path) -> Result<ExtractedVideos, Box<dyn std::error::Error>> {
-    // Convert PPT to PPTX using LibreOffice
-    let pptx_path = ppt_path.with_extension("pptx");
-
-    // Run LibreOffice conversion via Flatpak
-    let status = std::process::Command::new("flatpak")
-        .args([
-            "run",
-            "--filesystem=host",
-            "org.libreoffice.LibreOffice",
-            "--headless",
-            "--convert-to",
-            "pptx",
-            "--outdir",
-            ppt_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .to_str()
-                .unwrap(),
-            ppt_path.to_str().unwrap(),
-        ])
-        .status()?;
-
-    if !status.success() {
-        return Err("Failed to convert PPT to PPTX".into());
-    }
-
-    // Extract videos from the converted PPTX
-    let result = extract_videos_from_pptx(&pptx_path);
-
-    // Clean up the temporary PPTX file
-    let _ = std::fs::remove_file(&pptx_path);
-
-    result
 }
 
 // Helper function to create presentations directory

@@ -1,10 +1,75 @@
 use ordermap::OrderMap;
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RevealTransition {
+    pub kind: RevealTransitionKind,
+    pub speed: RevealTransitionSpeed,
+}
+
+impl RevealTransition {
+    pub fn is_default(&self) -> bool {
+        self.kind.is_default() && self.speed.is_default()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub enum RevealTransitionKind {
+    None,
+    Fade,
+
+    #[default]
+    Slide,
+    Convex,
+    Concave,
+    Zoom,
+}
+
+impl RevealTransitionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RevealTransitionKind::None => "none",
+            RevealTransitionKind::Fade => "fade",
+            RevealTransitionKind::Slide => "slide",
+            RevealTransitionKind::Convex => "convex",
+            RevealTransitionKind::Concave => "concave",
+            RevealTransitionKind::Zoom => "zoom",
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        matches!(self, RevealTransitionKind::Slide)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub enum RevealTransitionSpeed {
+    #[default]
+    Default,
+
+    Fast,
+    Slow,
+}
+
+impl RevealTransitionSpeed {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RevealTransitionSpeed::Default => "default",
+            RevealTransitionSpeed::Fast => "fast",
+            RevealTransitionSpeed::Slow => "slow",
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        matches!(self, RevealTransitionSpeed::Default)
+    }
+}
+
 /// Represents a presentation file for HTML generation
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PresentationFile {
     pub name: String,
+    pub transition: RevealTransition,
 }
 
 impl PresentationFile {
@@ -298,28 +363,41 @@ fn build_reveal_html(slides: &[PresentationFile]) -> String {
 
 /// Generates a slide section based on file type
 fn generate_slide_section(file: &PresentationFile) -> String {
+    let mut section = String::new();
+    section.push_str("<section");
+
     if file.is_video() {
-        format!(
-            r#"<section
-                    data-background-video="{}"
-                    data-autoplay
-                    data-background-size="cover"
-                    data-background-video-loop
-                ></section>"#,
+        section.push_str(&format!(
+            r#"data-background-video="{}" data-autoplay data-background-size="cover"
+            data-background-video-loop"#,
             html_escape(&file.name)
-        )
+        ));
     } else if file.is_image() {
-        format!(
-            r#"<section
-                    data-background-image="{}"
-                    data-background-size="contain"
-                ></section>"#,
+        section.push_str(&format!(
+            r#"data-background-image="{}" data-background-size="contain""#,
             html_escape(&file.name)
-        )
-    } else {
-        // Unsupported file type - return empty section
-        String::from("<section></section>")
+        ));
     }
+
+    if !file.transition.is_default() {
+        if !file.transition.kind.is_default() {
+            section.push_str(&format!(
+                " data-transition=\"{}\"",
+                file.transition.kind.as_str()
+            ));
+        }
+
+        if !file.transition.speed.is_default() {
+            section.push_str(&format!(
+                " data-transition-speed=\"{}\"",
+                file.transition.speed.as_str()
+            ));
+        }
+    }
+
+    section.push_str("></section>");
+
+    section
 }
 
 fn html_escape(text: &str) -> String {
@@ -338,12 +416,14 @@ mod tests {
     fn test_file_type_detection() {
         let video_file = PresentationFile {
             name: "PRESENTACION 1.1.mp4".to_string(),
+            transition: RevealTransition::default(),
         };
         assert!(video_file.is_video());
         assert!(!video_file.is_image());
 
         let image_file = PresentationFile {
             name: "PRESENTACION 1.0.png".to_string(),
+            transition: RevealTransition::default(),
         };
         assert!(image_file.is_image());
         assert!(!image_file.is_video());
@@ -356,12 +436,14 @@ mod tests {
             "PRESENTACION 1.0.png".to_string(),
             PresentationFile {
                 name: "PRESENTACION-1.0.png".to_string(),
+                transition: RevealTransition::default(),
             },
         );
         files.insert(
             "PRESENTACION-1.1.mp4".to_string(),
             PresentationFile {
                 name: "PRESENTACION-1.1.mp4".to_string(),
+                transition: RevealTransition::default(),
             },
         );
 
