@@ -364,7 +364,7 @@ fn build_reveal_html(slides: &[PresentationFile]) -> String {
 /// Generates a slide section based on file type
 fn generate_slide_section(file: &PresentationFile) -> String {
     let mut section = String::new();
-    section.push_str("<section");
+    section.push_str("<section ");
 
     if file.is_video() {
         section.push_str(&format!(

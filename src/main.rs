@@ -32,6 +32,8 @@ mod cmd;
 mod dashboard;
 mod html_generator;
 mod pptx_parser;
+mod utils;
+
 use html_generator::generate_empty_folder_html;
 use html_generator::generate_html;
 use html_generator::generate_no_folder_html;
@@ -42,6 +44,7 @@ use crate::cmd::open_link;
 use crate::{
     cmd::{app, try_run},
     html_generator::{RevealTransition, RevealTransitionKind, RevealTransitionSpeed},
+    utils::has_prefix_matches,
 };
 
 #[derive(Clone)]
@@ -241,7 +244,7 @@ async fn generate_html_endpoint(State(run_conf): State<RunningConf>) -> impl Int
     }
 
     // Get presentation files from directory
-    match get_presentation_files(&run_conf) {
+    match get_presentation_files(&run_conf).await {
         Ok(files) => {
             // Check if folder is empty (no valid media files)
             let has_valid_files = files.values().any(|f| f.is_image() || f.is_video());
@@ -483,7 +486,7 @@ async fn watch_presentations_dir(run_conf: RunningConf, mut shutdown: broadcast:
                 }
 
                 // Re-scan files and check if version changed
-                match get_presentation_files(&run_conf) {
+                match get_presentation_files(&run_conf).await {
                     Ok(files) => {
                         let new_version = compute_version(&files);
                         let mut conf = run_conf.0.lock().expect("Failed to lock config");
@@ -609,7 +612,7 @@ fn strip_generator_data(
 }
 
 // Helper function to get presentation files for HTML generation
-fn get_presentation_files(
+async fn get_presentation_files(
     run_conf: &RunningConf,
 ) -> Result<OrderMap<String, PresentationFile>, Box<dyn std::error::Error>> {
     // Get presentations_dir and set converting flag
@@ -655,15 +658,13 @@ fn get_presentation_files(
         // Handle PDF conversion
         if f_lower.ends_with(".pdf") {
             let pdf_path = entry.path();
-            let converted_files = strip_generator_data(convert_pdf_to_images(
-                &pdf_path,
-                HashSet::new(),
-                HashMap::new(),
-            )?);
+            let converted_files = strip_generator_data(
+                convert_pdf_to_images(&pdf_path, HashSet::new(), HashMap::new()).await?,
+            );
             files.extend(converted_files);
         } else if f_lower.ends_with(".pptx") {
             let pptx_path = entry.path();
-            let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
+            let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path).await?);
             files.extend(converted_files);
         } else if f_lower.ends_with(".ppt") {
             // For PPT files, convert to PPTX first, then extract videos and convert
@@ -693,7 +694,7 @@ fn get_presentation_files(
                     Ok(s) if s.success() && pptx_path.exists() => {
                         // Process the converted PPTX
                         let converted_files =
-                            strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
+                            strip_generator_data(convert_pptx_to_svgs(&pptx_path).await?);
 
                         files.extend(converted_files);
 
@@ -705,7 +706,7 @@ fn get_presentation_files(
                     }
                 }
             } else {
-                let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path)?);
+                let converted_files = strip_generator_data(convert_pptx_to_svgs(&pptx_path).await?);
 
                 files.extend(converted_files);
 
@@ -768,7 +769,7 @@ fn convert_pptx_to_pdf(pptx_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(pptx_path.with_extension("pdf"))
 }
 
-fn convert_pptx_to_svgs(
+async fn convert_pptx_to_svgs(
     pptx_path: &Path,
 ) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
     // First, extract any embedded videos from the PPTX
@@ -794,7 +795,8 @@ fn convert_pptx_to_svgs(
             &pdf_path,
             parse_result.slides_with_videos,
             parse_result.slides_with_transitions,
-        )?;
+        )
+        .await?;
         let _ = fs::remove_file(&pdf_path);
 
         // Filter out SVGs for slides that have videos (keep only videos)
@@ -851,18 +853,12 @@ fn convert_pptx_to_svgs(
     Ok(result)
 }
 
-fn convert_pdf_to_images(
+async fn convert_pdf_to_images(
     pdf_path: &Path,
     skip: HashSet<u32>,
     mut transitions: HashMap<u32, RevealTransition>,
 ) -> Result<OrderMap<String, GeneratorPresentationFile>, Box<dyn std::error::Error>> {
-    if pdf_path
-        .with_file_name(format!(
-            "{}_1.svg",
-            pdf_path.file_stem().expect("").to_str().expect("")
-        ))
-        .exists()
-    {
+    if has_prefix_matches(pdf_path).await? {
         // They already exist, will be picked as part of the FS pass
         return Ok(OrderMap::new());
     }
@@ -880,6 +876,7 @@ fn convert_pdf_to_images(
             pdf_path.file_stem().expect("").to_str().expect(""),
             i
         );
+
         let svg_status = app("pdf2svg")
             .unwrap()
             .arg(pdf_path)

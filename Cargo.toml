@@ -18,3 +18,4 @@ sysinfo = "0.32"
 zip = "2.2"
 roxmltree = "0.20"
 office_oxide = "0.1.2"
+tokio-stream = {version = "0.1.18", features =["fs"]}
